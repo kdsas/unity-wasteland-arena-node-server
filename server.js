@@ -51,13 +51,76 @@ db.serialize(() => {
     )
   `);
 });
+// ================= HTTP =================
+const server = http.createServer((req,res)=>{
+  res.writeHead(200);
+  res.end("Auth server online");
+});
+
+// ================= WEBSOCKET =================
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws)=>{
+  ws.on("message", (msg)=>{
+    let data;
+    try{ data = JSON.parse(msg.toString()); } catch { return; }
+
+    const { type, username, password_hash, json, sig, secret, device } = data;
+
+  // ===== GUILDS =====
+  db.run(`CREATE TABLE IF NOT EXISTS guilds (
+    guild_id TEXT PRIMARY KEY,
+    name TEXT UNIQUE,
+    owner TEXT,
+    created_at INTEGER
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS guild_members (
+    guild_id TEXT,
+    username TEXT,
+    role TEXT,
+    PRIMARY KEY (guild_id, username)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS guild_invites (
+    guild_id TEXT,
+    username TEXT,
+    invited_by TEXT,
+    created_at INTEGER,
+    PRIMARY KEY (guild_id, username)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS guild_bans (
+    guild_id TEXT,
+    username TEXT,
+    banned_by TEXT,
+    created_at INTEGER,
+    PRIMARY KEY (guild_id, username)
+  )`);
+});
+
+// ================= ROLES =================
+const ROLES = {
+  OWNER: "OWNER",
+  OFFICER: "OFFICER",
+  MEMBER: "MEMBER"
+};
+
+const PERMS = {
+  INVITE: ["OWNER","OFFICER"],
+  PROMOTE: ["OWNER"],
+  DEMOTE: ["OWNER"],
+  BAN: ["OWNER","OFFICER"],
+  UNBAN: ["OWNER"]
+};
+
+function hasPerm(role, action){
+  return PERMS[action]?.includes(role);
+}
 
 // ================= HWID =================
 function banHWID(hwid, reason){
-  db.run(
-    "INSERT OR IGNORE INTO hwid_bans(hwid, reason, created_at) VALUES(?,?,?)",
-    [hwid, reason, Date.now()]
-  );
+  db.run("INSERT OR IGNORE INTO hwid_bans VALUES(?,?,?)",[hwid,reason,Date.now()]);
 }
 
 function isHWIDBanned(hwid, cb){
@@ -90,6 +153,28 @@ function flag(username, reason){
   db.run("UPDATE users SET cheat_flags = cheat_flags + 1 WHERE username=?", [username]);
 }
 
+// ================= GUILD HELPERS =================
+function getUserGuild(username, cb){
+  db.get("SELECT guild_id, role FROM guild_members WHERE username=?", [username], (e,row)=>cb(row));
+}
+
+function guildSize(guild_id, cb){
+  db.get("SELECT COUNT(*) as count FROM guild_members WHERE guild_id=?", [guild_id],
+    (e,row)=>cb(row?.count||0));
+}
+
+  // ================= TIER =================
+    if(type === "TIER_LOAD"){
+      db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
+        const stats = row ? JSON.parse(row.json) : {};
+        const tier = computeTier(stats);
+        const sig = sign("TIER_"+tier, secret);
+        ws.send(JSON.stringify({ type:"TIER_RESP", tier, sig }));
+      });
+    }
+  });
+});
+
 // ================= TIER =================
 function computeTier(stats){
   if(stats.bossKills >= 25) return 7;
@@ -101,21 +186,14 @@ function computeTier(stats){
   return 1;
 }
 
-// ================= HTTP =================
-const server = http.createServer((req,res)=>{
-  res.writeHead(200);
-  res.end("Auth server online");
-});
-
-// ================= WEBSOCKET =================
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws)=>{
-  ws.on("message", (msg)=>{
-    let data;
-    try{ data = JSON.parse(msg.toString()); } catch { return; }
-
-    const { type, username, password_hash, json, sig, secret, device } = data;
+    // ===== SECURITY =====
+    if(type !== "REGISTER" && type !== "LOGIN"){
+      if(!secret) return;
+      if(sign(username, secret) !== sig){
+        flag(username,"BAD_SIGNATURE");
+        return;
+      }
+    }
 
     // ================= REGISTER =================
     if(type === "REGISTER"){
@@ -133,8 +211,7 @@ wss.on("connection", (ws)=>{
       );
       return;
     }
-
-    // ================= LOGIN =================
+  // ================= LOGIN =================
     if(type === "LOGIN"){
       isHWIDBanned(device, (reason)=>{
         if(reason){
@@ -181,18 +258,69 @@ wss.on("connection", (ws)=>{
       return;
     }
 
-    // ================= STATS LOAD =================
-    if(type === "STATS_LOAD"){
-      db.get("SELECT secret FROM users WHERE username=?", [username], (e,u)=>{
-        if(!u || u.secret !== secret) return;
-        db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
-          ws.send(JSON.stringify({ type:"STATS_LOAD_RESP", json: row ? row.json : "{}" }));
+    // ===== GUILD CREATE =====
+    if(type==="GUILD_CREATE"){
+      const id = crypto.randomUUID();
+
+      db.run("INSERT INTO guilds VALUES(?,?,?,?)",
+        [id,data.name,username,Date.now()],
+        err=>{
+          if(err){
+            ws.send(JSON.stringify({type:"GUILD_CREATE_RESP",success:false}));
+            return;
+          }
+
+          db.run("INSERT INTO guild_members VALUES(?,?,?)",
+            [id,username,ROLES.OWNER]);
+
+          ws.send(JSON.stringify({type:"GUILD_CREATE_RESP",success:true,guild_id:id}));
+        });
+      return;
+    }
+
+    // ===== GUILD ACCEPT (AUTO OFFICER) =====
+    if(type==="GUILD_ACCEPT"){
+      db.get("SELECT guild_id FROM guild_invites WHERE username=?",[username],(e,row)=>{
+        if(!row) return;
+
+        guildSize(row.guild_id,(count)=>{
+
+          const role = (count === 1)
+            ? ROLES.OFFICER   // ⭐ SECOND MEMBER
+            : ROLES.MEMBER;
+
+          db.run("INSERT INTO guild_members VALUES(?,?,?)",
+            [row.guild_id,username,role]);
+
+          db.run("DELETE FROM guild_invites WHERE username=?", [username]);
         });
       });
       return;
     }
 
-    // ================= STATS SAVE =================
+    // ===== GUILD LOAD =====
+    if(type==="GUILD_LOAD"){
+      getUserGuild(username,(g)=>{
+        if(!g){
+          ws.send(JSON.stringify({type:"GUILD_LOAD_RESP",guild:null}));
+          return;
+        }
+
+        db.all("SELECT username,role FROM guild_members WHERE guild_id=?",
+          [g.guild_id],
+          (e,members)=>{
+            ws.send(JSON.stringify({
+              type:"GUILD_LOAD_RESP",
+              guild_id:g.guild_id,
+              role:g.role,
+              members
+            }));
+          });
+      });
+      return;
+    }
+
+   // ================= STATS SAVE =================
     if(type === "STATS_SAVE"){
       db.get("SELECT secret,last_stats_hash FROM users WHERE username=?", [username], (e,user)=>{
         if(!user) return;
@@ -226,19 +354,17 @@ wss.on("connection", (ws)=>{
       });
       return;
     }
-
-    // ================= TIER =================
-    if(type === "TIER_LOAD"){
-      db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
-        const stats = row ? JSON.parse(row.json) : {};
-        const tier = computeTier(stats);
-        const sig = sign("TIER_"+tier, secret);
-        ws.send(JSON.stringify({ type:"TIER_RESP", tier, sig }));
+// ================= STATS LOAD =================
+    if(type === "STATS_LOAD"){
+      db.get("SELECT secret FROM users WHERE username=?", [username], (e,u)=>{
+        if(!u || u.secret !== secret) return;
+        db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
+          ws.send(JSON.stringify({ type:"STATS_LOAD_RESP", json: row ? row.json : "{}" }));
+        });
       });
+      return;
     }
-  });
-});
 
 // ================= START =================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, ()=>console.log("Auth server running on", PORT));
+server.listen(PORT, ()=>console.log("Auth server running on", PORT)); 
