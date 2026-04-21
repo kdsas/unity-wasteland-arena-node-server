@@ -63,9 +63,121 @@ const wss = new WebSocketServer({ server });
 wss.on("connection", (ws)=>{
   ws.on("message", (msg)=>{
     let data;
-    try{ data = JSON.parse(msg.toString()); } catch { return; }
+    try{ data = JSON.parse(msg.toString()); } catch { return;
 
-    const { type, username, password_hash, json, sig, secret, device } = data;
+
+if(type === "FRIEND_REQUEST"){
+  isBlocked(username, data.target, (blocked)=>{
+    if(blocked) return;
+
+    db.run(
+      "INSERT OR IGNORE INTO friend_requests VALUES(?,?,?)",
+      [username, data.target, Date.now()]
+    );
+  });
+  return;
+}
+
+if(type === "FRIEND_WITHDRAW"){
+  db.run(
+    "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+    [username, data.target]
+  );
+  return;
+}
+
+if(type === "FRIEND_ACCEPT"){
+  db.get(
+    "SELECT 1 FROM friend_requests WHERE from_user=? AND to_user=?",
+    [data.target, username],
+    (e,row)=>{
+      if(!row) return;
+
+      db.run("INSERT INTO friends VALUES(?,?,?)",
+        [username, data.target, Date.now()]);
+
+      db.run("DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+        [data.target, username]);
+    }
+  );
+  return;
+}
+
+if(type === "FRIEND_REJECT"){
+  db.run(
+    "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+    [data.target, username]
+  );
+  return;
+}
+
+if(type === "FRIEND_DELETE"){
+  db.run(
+    "DELETE FROM friends WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)",
+    [username, data.target, data.target, username]
+  );
+  return;
+}
+
+if(type === "BLOCK_ADD"){
+  db.run(
+    "INSERT OR IGNORE INTO blocks VALUES(?,?,?)",
+    [username, data.target, Date.now()]
+  );
+
+  // remove friendship
+  db.run(
+    "DELETE FROM friends WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)",
+    [username, data.target, data.target, username]
+  );
+
+  // remove requests
+  db.run(
+    "DELETE FROM friend_requests WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)",
+    [username, data.target, data.target, username]
+  );
+
+  return;
+}
+
+if(type === "BLOCK_REMOVE"){
+  db.run(
+    "DELETE FROM blocks WHERE blocker=? AND blocked=?",
+    [username, data.target]
+  );
+  return;
+}
+
+if(type === "FRIENDS_LOAD"){
+  db.all(
+    "SELECT * FROM friends WHERE user1=? OR user2=?",
+    [username, username],
+    (e,friends)=>{
+
+      db.all(
+        "SELECT * FROM friend_requests WHERE to_user=?",
+        [username],
+        (e,requests)=>{
+
+          db.all(
+            "SELECT blocked FROM blocks WHERE blocker=?",
+            [username],
+            (e,blocks)=>{
+
+              ws.send(JSON.stringify({
+                type:"FRIENDS_LOAD_RESP",
+                friends,
+                requests,
+                blocks
+              }));
+
+            });
+        });
+    });
+  return;
+}
+}
+const { type, username, password_hash, json, sig, secret, device } = data;
 
   // ===== GUILDS =====
   db.run(`CREATE TABLE IF NOT EXISTS guilds (
