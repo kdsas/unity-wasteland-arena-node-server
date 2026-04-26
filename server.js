@@ -19,215 +19,64 @@ function sign(data, secret) {
 function sha(s) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
+function normalizePair(a, b){
+  return a < b ? [a, b] : [b, a];
+}
 
 // ================= SQLITE =================
-const dbFile = path.join(__dirname, "users.db");
-const db = new sqlite3.Database(dbFile);
+const db = new sqlite3.Database(path.join(__dirname, "users.db"));
 
 db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      username TEXT PRIMARY KEY,
-      password_hash TEXT,
-      secret TEXT,
-      cheat_flags INTEGER DEFAULT 0,
-      last_stats_hash TEXT,
-      device TEXT
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT,
+    secret TEXT,
+    cheat_flags INTEGER DEFAULT 0,
+    last_stats_hash TEXT,
+    device TEXT
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS player_stats (
-      username TEXT PRIMARY KEY,
-      json TEXT
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS player_stats (
+    username TEXT PRIMARY KEY,
+    json TEXT
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS hwid_bans (
-      hwid TEXT PRIMARY KEY,
-      reason TEXT,
-      created_at INTEGER
-    )
-  `);
-});
-// ================= HTTP =================
-const server = http.createServer((req,res)=>{
-  res.writeHead(200);
-  res.end("Auth server online");
-});
-
-// ================= WEBSOCKET =================
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws)=>{
-  ws.on("message", (msg)=>{
-    let data;
-    try{ data = JSON.parse(msg.toString()); } catch { return;
-
-
-if(type === "FRIEND_REQUEST"){
-  isBlocked(username, data.target, (blocked)=>{
-    if(blocked) return;
-
-    db.run(
-      "INSERT OR IGNORE INTO friend_requests VALUES(?,?,?)",
-      [username, data.target, Date.now()]
-    );
-  });
-  return;
-}
-
-if(type === "FRIEND_WITHDRAW"){
-  db.run(
-    "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
-    [username, data.target]
-  );
-  return;
-}
-
-if(type === "FRIEND_ACCEPT"){
-  db.get(
-    "SELECT 1 FROM friend_requests WHERE from_user=? AND to_user=?",
-    [data.target, username],
-    (e,row)=>{
-      if(!row) return;
-
-      db.run("INSERT INTO friends VALUES(?,?,?)",
-        [username, data.target, Date.now()]);
-
-      db.run("DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
-        [data.target, username]);
-    }
-  );
-  return;
-}
-
-if(type === "FRIEND_REJECT"){
-  db.run(
-    "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
-    [data.target, username]
-  );
-  return;
-}
-
-if(type === "FRIEND_DELETE"){
-  db.run(
-    "DELETE FROM friends WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)",
-    [username, data.target, data.target, username]
-  );
-  return;
-}
-
-if(type === "BLOCK_ADD"){
-  db.run(
-    "INSERT OR IGNORE INTO blocks VALUES(?,?,?)",
-    [username, data.target, Date.now()]
-  );
-
-  // remove friendship
-  db.run(
-    "DELETE FROM friends WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)",
-    [username, data.target, data.target, username]
-  );
-
-  // remove requests
-  db.run(
-    "DELETE FROM friend_requests WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)",
-    [username, data.target, data.target, username]
-  );
-
-  return;
-}
-
-if(type === "BLOCK_REMOVE"){
-  db.run(
-    "DELETE FROM blocks WHERE blocker=? AND blocked=?",
-    [username, data.target]
-  );
-  return;
-}
-
-if(type === "FRIENDS_LOAD"){
-  db.all(
-    "SELECT * FROM friends WHERE user1=? OR user2=?",
-    [username, username],
-    (e,friends)=>{
-
-      db.all(
-        "SELECT * FROM friend_requests WHERE to_user=?",
-        [username],
-        (e,requests)=>{
-
-          db.all(
-            "SELECT blocked FROM blocks WHERE blocker=?",
-            [username],
-            (e,blocks)=>{
-
-              ws.send(JSON.stringify({
-                type:"FRIENDS_LOAD_RESP",
-                friends,
-                requests,
-                blocks
-              }));
-
-            });
-        });
-    });
-  return;
-}
-}
-const { type, username, password_hash, json, sig, secret, device } = data;
-
-  // ===== GUILDS =====
-  db.run(`CREATE TABLE IF NOT EXISTS guilds (
-    guild_id TEXT PRIMARY KEY,
-    name TEXT UNIQUE,
-    owner TEXT,
+  db.run(`CREATE TABLE IF NOT EXISTS hwid_bans (
+    hwid TEXT PRIMARY KEY,
+    reason TEXT,
     created_at INTEGER
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS guild_members (
-    guild_id TEXT,
-    username TEXT,
-    role TEXT,
-    PRIMARY KEY (guild_id, username)
+  // 🔒 Safe tables
+  db.run(`CREATE TABLE IF NOT EXISTS friends (
+    user1 TEXT,
+    user2 TEXT,
+    created_at INTEGER,
+    UNIQUE(user1,user2)
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS guild_invites (
-    guild_id TEXT,
-    username TEXT,
-    invited_by TEXT,
+  db.run(`CREATE TABLE IF NOT EXISTS friend_requests (
+    from_user TEXT,
+    to_user TEXT,
     created_at INTEGER,
-    PRIMARY KEY (guild_id, username)
+    UNIQUE(from_user,to_user)
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS guild_bans (
-    guild_id TEXT,
-    username TEXT,
-    banned_by TEXT,
+  db.run(`CREATE TABLE IF NOT EXISTS blocks (
+    blocker TEXT,
+    blocked TEXT,
     created_at INTEGER,
-    PRIMARY KEY (guild_id, username)
+    UNIQUE(blocker,blocked)
   )`);
 });
 
-// ================= ROLES =================
-const ROLES = {
-  OWNER: "OWNER",
-  OFFICER: "OFFICER",
-  MEMBER: "MEMBER"
-};
-
-const PERMS = {
-  INVITE: ["OWNER","OFFICER"],
-  PROMOTE: ["OWNER"],
-  DEMOTE: ["OWNER"],
-  BAN: ["OWNER","OFFICER"],
-  UNBAN: ["OWNER"]
-};
-
-function hasPerm(role, action){
-  return PERMS[action]?.includes(role);
+// ================= HELPERS =================
+function isBlocked(a,b,cb){
+  db.get(
+    `SELECT 1 FROM blocks WHERE (blocker=? AND blocked=?) OR (blocker=? AND blocked=?)`,
+    [a,b,b,a],
+    (e,row)=>cb(!!row)
+  );
 }
 
 // ================= HWID =================
@@ -265,28 +114,6 @@ function flag(username, reason){
   db.run("UPDATE users SET cheat_flags = cheat_flags + 1 WHERE username=?", [username]);
 }
 
-// ================= GUILD HELPERS =================
-function getUserGuild(username, cb){
-  db.get("SELECT guild_id, role FROM guild_members WHERE username=?", [username], (e,row)=>cb(row));
-}
-
-function guildSize(guild_id, cb){
-  db.get("SELECT COUNT(*) as count FROM guild_members WHERE guild_id=?", [guild_id],
-    (e,row)=>cb(row?.count||0));
-}
-
-  // ================= TIER =================
-    if(type === "TIER_LOAD"){
-      db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
-        const stats = row ? JSON.parse(row.json) : {};
-        const tier = computeTier(stats);
-        const sig = sign("TIER_"+tier, secret);
-        ws.send(JSON.stringify({ type:"TIER_RESP", tier, sig }));
-      });
-    }
-  });
-});
-
 // ================= TIER =================
 function computeTier(stats){
   if(stats.bossKills >= 25) return 7;
@@ -297,6 +124,29 @@ function computeTier(stats){
   if(stats.bossKills >= 3)  return 2;
   return 1;
 }
+
+// ================= HTTP =================
+const server = http.createServer((req,res)=>{
+  res.writeHead(200);
+  res.end("Auth server online");
+});
+
+// ================= WEBSOCKET =================
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws)=>{
+
+  ws.on("message", (msg)=>{
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    const { type, username, password_hash, json, sig, secret, device } = data;
+
+    if(!type || !username) return;
 
     // ===== SECURITY =====
     if(type !== "REGISTER" && type !== "LOGIN"){
@@ -323,7 +173,8 @@ function computeTier(stats){
       );
       return;
     }
-  // ================= LOGIN =================
+
+    // ================= LOGIN =================
     if(type === "LOGIN"){
       isHWIDBanned(device, (reason)=>{
         if(reason){
@@ -370,69 +221,143 @@ function computeTier(stats){
       return;
     }
 
-    // ===== GUILD CREATE =====
-    if(type==="GUILD_CREATE"){
-      const id = crypto.randomUUID();
+    // ================= FRIEND SYSTEM =================
+    if(type === "FRIEND_REQUEST"){
+      const target = data.target;
+      if(!target || username === target) return;
 
-      db.run("INSERT INTO guilds VALUES(?,?,?,?)",
-        [id,data.name,username,Date.now()],
-        err=>{
-          if(err){
-            ws.send(JSON.stringify({type:"GUILD_CREATE_RESP",success:false}));
-            return;
+      isBlocked(username, target, (blocked)=>{
+        if(blocked) return;
+
+        const [u1,u2] = normalizePair(username, target);
+
+        db.get(
+          "SELECT 1 FROM friends WHERE user1=? AND user2=?",
+          [u1,u2],
+          (e,row)=>{
+            if(row) return;
+
+            db.run(
+              "INSERT OR IGNORE INTO friend_requests VALUES(?,?,?)",
+              [username, target, Date.now()]
+            );
           }
-
-          db.run("INSERT INTO guild_members VALUES(?,?,?)",
-            [id,username,ROLES.OWNER]);
-
-          ws.send(JSON.stringify({type:"GUILD_CREATE_RESP",success:true,guild_id:id}));
-        });
-      return;
-    }
-
-    // ===== GUILD ACCEPT (AUTO OFFICER) =====
-    if(type==="GUILD_ACCEPT"){
-      db.get("SELECT guild_id FROM guild_invites WHERE username=?",[username],(e,row)=>{
-        if(!row) return;
-
-        guildSize(row.guild_id,(count)=>{
-
-          const role = (count === 1)
-            ? ROLES.OFFICER   // ⭐ SECOND MEMBER
-            : ROLES.MEMBER;
-
-          db.run("INSERT INTO guild_members VALUES(?,?,?)",
-            [row.guild_id,username,role]);
-
-          db.run("DELETE FROM guild_invites WHERE username=?", [username]);
-        });
+        );
       });
       return;
     }
 
-    // ===== GUILD LOAD =====
-    if(type==="GUILD_LOAD"){
-      getUserGuild(username,(g)=>{
-        if(!g){
-          ws.send(JSON.stringify({type:"GUILD_LOAD_RESP",guild:null}));
-          return;
-        }
+    if(type === "FRIEND_WITHDRAW"){
+      db.run(
+        "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+        [username, data.target]
+      );
+      return;
+    }
 
-        db.all("SELECT username,role FROM guild_members WHERE guild_id=?",
-          [g.guild_id],
-          (e,members)=>{
-            ws.send(JSON.stringify({
-              type:"GUILD_LOAD_RESP",
-              guild_id:g.guild_id,
-              role:g.role,
-              members
-            }));
+    if(type === "FRIEND_ACCEPT"){
+      const target = data.target;
+      if(!target || username === target) return;
+
+      const [u1,u2] = normalizePair(username, target);
+
+      db.get(
+        "SELECT 1 FROM friend_requests WHERE from_user=? AND to_user=?",
+        [target, username],
+        (e,row)=>{
+          if(!row) return;
+
+          db.serialize(()=>{
+            db.run(
+              "INSERT OR IGNORE INTO friends VALUES(?,?,?)",
+              [u1,u2,Date.now()]
+            );
+
+            db.run(
+              "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+              [target, username]
+            );
           });
-      });
+        }
+      );
       return;
     }
 
-   // ================= STATS SAVE =================
+    if(type === "FRIEND_REJECT"){
+      db.run(
+        "DELETE FROM friend_requests WHERE from_user=? AND to_user=?",
+        [data.target, username]
+      );
+      return;
+    }
+
+    if(type === "FRIEND_DELETE"){
+      const [u1,u2] = normalizePair(username, data.target);
+      db.run("DELETE FROM friends WHERE user1=? AND user2=?", [u1,u2]);
+      return;
+    }
+
+    if(type === "BLOCK_ADD"){
+      const target = data.target;
+      if(!target || username === target) return;
+
+      db.serialize(()=>{
+        db.run(
+          "INSERT OR IGNORE INTO blocks VALUES(?,?,?)",
+          [username, target, Date.now()]
+        );
+
+        const [u1,u2] = normalizePair(username, target);
+
+        db.run("DELETE FROM friends WHERE user1=? AND user2=?", [u1,u2]);
+
+        db.run(
+          "DELETE FROM friend_requests WHERE (from_user=? AND to_user=?) OR (from_user=? AND to_user=?)",
+          [username, target, target, username]
+        );
+      });
+
+      return;
+    }
+
+    if(type === "BLOCK_REMOVE"){
+      db.run(
+        "DELETE FROM blocks WHERE blocker=? AND blocked=?",
+        [username, data.target]
+      );
+      return;
+    }
+
+    if(type === "FRIENDS_LOAD"){
+      db.all(
+        "SELECT * FROM friends WHERE user1=? OR user2=?",
+        [username, username],
+        (e,friends)=>{
+
+          db.all(
+            "SELECT * FROM friend_requests WHERE to_user=?",
+            [username],
+            (e,requests)=>{
+
+              db.all(
+                "SELECT blocked FROM blocks WHERE blocker=?",
+                [username],
+                (e,blocks)=>{
+
+                  ws.send(JSON.stringify({
+                    type:"FRIENDS_LOAD_RESP",
+                    friends,
+                    requests,
+                    blocks
+                  }));
+
+                });
+            });
+        });
+      return;
+    }
+
+    // ================= STATS SAVE =================
     if(type === "STATS_SAVE"){
       db.get("SELECT secret,last_stats_hash FROM users WHERE username=?", [username], (e,user)=>{
         if(!user) return;
@@ -466,17 +391,37 @@ function computeTier(stats){
       });
       return;
     }
-// ================= STATS LOAD =================
+
+    // ================= STATS LOAD =================
     if(type === "STATS_LOAD"){
       db.get("SELECT secret FROM users WHERE username=?", [username], (e,u)=>{
         if(!u || u.secret !== secret) return;
+
         db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
-          ws.send(JSON.stringify({ type:"STATS_LOAD_RESP", json: row ? row.json : "{}" }));
+          ws.send(JSON.stringify({
+            type:"STATS_LOAD_RESP",
+            json: row ? row.json : "{}"
+          }));
         });
       });
       return;
     }
 
+    // ================= TIER =================
+    if(type === "TIER_LOAD"){
+      db.get("SELECT json FROM player_stats WHERE username=?", [username], (e,row)=>{
+        const stats = row ? JSON.parse(row.json) : {};
+        const tier = computeTier(stats);
+        const s = sign("TIER_"+tier, secret);
+
+        ws.send(JSON.stringify({ type:"TIER_RESP", tier, sig:s }));
+      });
+    }
+
+  });
+
+});
+
 // ================= START =================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, ()=>console.log("Auth server running on", PORT)); 
+server.listen(PORT, ()=>console.log("Auth server running on", PORT));
