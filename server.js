@@ -14,9 +14,11 @@ const fs = require("fs");
 
 // ================= CONFIG =================
 
-const BACKUP_DIR = "./backups";
+const BACKUP_DIR = path.join(DB_DIR, "backups");
 
-if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
+if (!fs.existsSync(BACKUP_DIR)) {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+}
 
 
 
@@ -76,7 +78,11 @@ state
 
 // ================= SQLITE =================
 
-const db = new sqlite3.Database(path.join(__dirname, "users.db"));
+const DB_DIR = process.env.DB_DIR || "/data";
+
+const db = new sqlite3.Database(
+    path.join(DB_DIR, "users.db")
+);
 
 
 
