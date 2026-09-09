@@ -39,10 +39,10 @@ const DB_DIR = process.env.DB_DIR || "/data";
 
 if (!fs.existsSync(DB_DIR)) {
 
-    fs.mkdirSync(
-        DB_DIR,
-        { recursive: true }
-    );
+fs.mkdirSync(
+    DB_DIR,
+    { recursive: true }
+);
 
 }
 
@@ -58,10 +58,10 @@ DB_DIR,
 
 if (!fs.existsSync(BACKUP_DIR)) {
 
-    fs.mkdirSync(
-        BACKUP_DIR,
-        { recursive: true }
-    );
+fs.mkdirSync(
+    BACKUP_DIR,
+    { recursive: true }
+);
 
 }
 
@@ -129,6 +129,7 @@ return a < b
 // ============================================================
 
 function ensureRandomAdmins() {
+
     db.get(
         `SELECT COUNT(*) AS count FROM moderators WHERE active=1`,
         [],
@@ -200,10 +201,15 @@ wss.clients.forEach(c => {
 
         c.send(
             JSON.stringify({
+
                 type: "PRESENCE_UPDATE",
+
                 username,
+
                 online,
+
                 state
+
             })
         );
 
@@ -250,6 +256,9 @@ DB_PATH,
 
 db.serialize(() => {
 
+// WAL allows SQLite to handle reads
+// while writes are occurring.
+
 db.run(
     "PRAGMA journal_mode = WAL",
     err => {
@@ -273,6 +282,9 @@ db.run(
 );
 
 
+// Good balance between durability
+// and performance for this server.
+
 db.run(
     "PRAGMA synchronous = NORMAL",
     err => {
@@ -289,6 +301,9 @@ db.run(
     }
 );
 
+
+// Prevent immediate SQLITE_BUSY failures
+// when multiple operations briefly overlap.
 
 db.run(
     "PRAGMA busy_timeout = 5000",
@@ -887,7 +902,7 @@ wss.on(
                 }
             });
 
-            // PRESENCE
+// PRESENCE
             // ====================================================
 
             if (
@@ -968,22 +983,36 @@ wss.on(
 
                 const payload =
                     JSON.stringify({
+
                         type:
                             "CHAT_RESP",
+
                         username,
+
                         message,
+
                         channel,
+
                         target,
+
                         msgId,
+
                         serverTime:
-                            Date.now()
+                                                   Date.now()
+
                     });
 
 
                 // IMPORTANT:
-                // Keep chat broadcast behavior unchanged.
-                // Every connected client receives the message.
-                // The Unity UI handles final visibility filtering.
+                //
+                // Chat is intentionally broadcast
+                // to every connected client.
+                //
+                // SimpleChatUI performs the final
+                // whisper visibility filtering.
+                //
+                // DO NOT change this to
+                // target-only routing.
 
                 wss.clients.forEach(
                     client => {
@@ -992,7 +1021,9 @@ wss.on(
                             client.readyState === 1
                         ) {
 
-                            client.send(payload);
+                            client.send(
+                                payload
+                            );
 
                         }
 
@@ -1012,30 +1043,6 @@ wss.on(
             if (
                 type === "REGISTER"
             ) {
-
-                if (
-                    !password_hash
-                ) {
-
-                    ws.send(
-                        JSON.stringify({
-
-                            type:
-                                "REGISTER_RESP",
-
-                            success:
-                                false,
-
-                            message:
-                                "Invalid password."
-
-                        })
-                    );
-
-                    return;
-
-                }
-
 
                 const s =
                     makeSecret();
@@ -1059,31 +1066,52 @@ wss.on(
                     ],
                     err => {
 
-                        ws.send(
-                            JSON.stringify({
+                        if (err) {
 
-                                type:
-                                    "REGISTER_RESP",
-
-                                success:
-                                    !err,
-
-                                secret:
-                                    s,
-
-                                message:
-                                    err
-                                        ? "Registration failed."
-                                        : "Registration successful."
-
-                            })
-                        );
+                            console.error(
+                                "❌ Registration failed:",
+                                err.message
+                            );
 
 
-                        if (!err) {
+                            ws.send(
+                                JSON.stringify({
 
-                            // Fill any remaining random admin slots.
+                                    type:
+                                        "REGISTER_RESP",
+
+                                    success:
+                                        false
+
+                                })
+                            );
+
+                        } else {
+
+                            console.log(
+                                "✅ Registered user:",
+                                username
+                            );
+
+                            // If the permanent admin slots are not full yet,
+                            // randomly fill the remaining slots from the player base.
                             ensureRandomAdmins();
+
+
+                            ws.send(
+                                JSON.stringify({
+
+                                    type:
+                                        "REGISTER_RESP",
+
+                                    success:
+                                        true,
+
+                                    secret:
+                                        s
+
+                                })
+                            );
 
                         }
 
@@ -1104,24 +1132,11 @@ wss.on(
                 type === "LOGIN"
             ) {
 
-                db.get(
-                    `
-                    SELECT
-                        password_hash,
-                        secret,
-                        cheat_flags,
-                        device
-                    FROM users
-                    WHERE username=?
-                    `,
-                    [username],
-                    (e, row) => {
+                isHWIDBanned(
+                    device,
+                    (reason) => {
 
-                        if (
-                            !row ||
-                            row.password_hash !==
-                                password_hash
-                        ) {
+                        if (reason) {
 
                             ws.send(
                                 JSON.stringify({
@@ -1130,7 +1145,11 @@ wss.on(
                                         "LOGIN_RESP",
 
                                     success:
-                                        false
+                                        false,
+
+                                    message:
+                                        "HWID BANNED: " +
+                                        reason
 
                                 })
                             );
@@ -1140,20 +1159,62 @@ wss.on(
                         }
 
 
-                        // ====================================================
-                        // ACCOUNT BAN CHECK
-                        // ====================================================
-
                         db.get(
                             `
-                            SELECT reason
-                            FROM account_bans
+                            SELECT
+                                password_hash,
+                                secret,
+                                cheat_flags,
+                                device
+                            FROM users
                             WHERE username=?
                             `,
                             [username],
-                            (banErr, banRow) => {
+                            (e, row) => {
 
-                                if (banRow) {
+                                if (
+                                    !row ||
+                                    row.password_hash !==
+                                        password_hash
+                                ) {
+
+                                    ws.send(
+                                        JSON.stringify({
+
+                                            type:
+                                                "LOGIN_RESP",
+
+                                            success:
+                                                false
+
+                                        })
+                                    );
+
+                                    return;
+
+                                }
+
+
+                                db.get(
+                                    `SELECT reason FROM account_bans WHERE username=?`,
+                                    [username],
+                                    (banErr, banRow) => {
+
+                                        if (banRow) {
+                                            ws.send(
+                                                JSON.stringify({
+                                                    type: "LOGIN_RESP",
+                                                    success: false,
+                                                    message: "Account banned: " + (banRow.reason || "Moderator ban")
+                                                })
+                                            );
+                                            return;
+                                        }
+
+                                        if (
+                                            row.cheat_flags >=
+                                            3
+                                        ) {
 
                                     ws.send(
                                         JSON.stringify({
@@ -1165,8 +1226,7 @@ wss.on(
                                                 false,
 
                                             message:
-                                                "Account banned: " +
-                                                (banRow.reason || "No reason provided.")
+                                                "Account banned"
 
                                         })
                                     );
@@ -1176,1755 +1236,69 @@ wss.on(
                                 }
 
 
-                                // ====================================================
-                                // HWID BAN CHECK
-                                // ====================================================
-
-                                isHWIDBanned(
-                                    device,
-                                    hwidReason => {
-
-                                        if (hwidReason) {
-
-                                            ws.send(
-                                                JSON.stringify({
-
-                                                    type:
-                                                        "LOGIN_RESP",
-
-                                                    success:
-                                                        false,
-
-                                                    message:
-                                                        "Device banned: " +
-                                                        hwidReason
-
-                                                })
-                                            );
-
-                                            return;
-
-                                        }
-
-
-                                        // ====================================================
-                                        // CHEAT FLAG BAN
-                                        // ====================================================
-
-                                        if (
-                                            row.cheat_flags >= 3
-                                        ) {
-
-                                            ws.send(
-                                                JSON.stringify({
-
-                                                    type:
-                                                        "LOGIN_RESP",
-
-                                                    success:
-                                                        false,
-
-                                                    message:
-                                                        "Account banned"
-
-                                                })
-                                            );
-
-                                            return;
-
-                                        }
-
-
-                                        // ====================================================
-                                        // REPLACE OLD SESSION
-                                        // ====================================================
-
-                                        if (
-                                            onlineUsers.has(username)
-                                        ) {
-
-                                            try {
-
-                                                onlineUsers
-                                                    .get(username)
-                                                    .close();
-
-                                            } catch {}
-
-                                        }
-
-
-                                        onlineUsers.set(
-                                            username,
-                                            ws
-                                        );
-
-
-                                        ws.username =
-                                            username;
-
-
-                                        // ====================================================
-                                        // ADMIN STATUS
-                                        // ====================================================
-
-                                        getAdmin(
-                                            username,
-                                            isAdmin => {
-
-                                                ws.isAdmin =
-                                                    isAdmin;
-
-                                                ws.adminStatus =
-                                                    isAdmin;
-
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "LOGIN_RESP",
-
-                                                        success:
-                                                            true,
-
-                                                        secret:
-                                                            row.secret,
-
-                                                        admin:
-                                                            isAdmin
-
-                                                    })
-                                                );
-
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "ADMIN_STATUS",
-
-                                                        admin:
-                                                            isAdmin
-
-                                                    })
-                                                );
-
-
-                                                // ====================================================
-                                                // PRESENCE
-                                                // ====================================================
-
-                                                broadcastPresence(
-                                                    username,
-                                                    true,
-                                                    "online"
-                                                );
-
-
-                                                broadcastToFriends(
-                                                    username,
-                                                    true
-                                                );
-
-
-                                                sendInitialPresence(
-                                                    username
-                                                );
-
-                                            }
-                                        );
-
-                                    }
-                                );
-
-                            }
-                        );
-
-                    }
-                );
-
-
-                return;
-
-            }
-// ============================================================
-// CONTINUATION OF SERVER MESSAGE HANDLER
-// ============================================================
-
-// The following section continues the authenticated
-// WebSocket message handling.
-
-// ============================================================
-// HWID BAN HELPERS
-// ============================================================
-
-function banHWID(
-    hwid,
-    reason
-) {
-
-    if (!hwid) {
-        return;
-    }
-
-    db.run(
-        `
-        INSERT OR IGNORE INTO hwid_bans
-        VALUES(?,?,?)
-        `,
-        [
-            hwid,
-            reason,
-            Date.now()
-        ],
-        err => {
-
-            if (err) {
-
-                console.error(
-                    "❌ Failed to ban HWID:",
-                    err.message
-                );
-
-            }
-
-        }
-    );
-
-}
-
-function isHWIDBanned(
-    hwid,
-    cb
-) {
-
-    if (!hwid) {
-
-        cb(null);
-
-        return;
-
-    }
-
-    db.get(
-        `
-        SELECT reason
-        FROM hwid_bans
-        WHERE hwid=?
-        `,
-        [hwid],
-        (e, row) => {
-
-            cb(
-                row
-                    ? row.reason
-                    : null
-            );
-
-        }
-    );
-
-}
-
-// ============================================================
-// CHEAT DETECTION
-// ============================================================
-
-function isImpossible(
-    oldS,
-    newS
-) {
-
-    if (
-        !oldS ||
-        !oldS.kills
-    ) {
-
-        return false;
-
-    }
-
-    if (
-        (newS.kills || 0) -
-        (oldS.kills || 0) >
-        50
-    ) {
-
-        return true;
-
-    }
-
-    if (
-        (newS.bossKills || 0) -
-        (oldS.bossKills || 0) >
-        3
-    ) {
-
-        return true;
-
-    }
-
-    if (
-        (newS.xp || 0) -
-        (oldS.xp || 0) >
-        10000
-    ) {
-
-        return true;
-
-    }
-
-    if (
-        (newS.timeSurvived || 0) -
-        (oldS.timeSurvived || 0) >
-        3600
-    ) {
-
-        return true;
-
-    }
-
-    return false;
-
-}
-
-function flag(
-    username,
-    reason
-) {
-
-    console.log(
-        "🚨 CHEAT:",
-        username,
-        reason
-    );
-
-    db.get(
-        `
-        SELECT device
-        FROM users
-        WHERE username=?
-        `,
-        [username],
-        (e, row) => {
-
-            if (
-                row?.device
-            ) {
-
-                if (
-                    reason ===
-                        "IMPOSSIBLE_PROGRESS" ||
-                    reason ===
-                        "BAD_SIGNATURE"
-                ) {
-
-                    banHWID(
-                        row.device,
-                        "Cheating"
-                    );
-
-                }
-
-            }
-
-        }
-    );
-
-    db.run(
-        `
-        UPDATE users
-        SET cheat_flags = cheat_flags + 1
-        WHERE username=?
-        `,
-        [username]
-    );
-
-}
-
-// ============================================================
-// TIER
-// ============================================================
-
-function computeTier(
-    stats
-) {
-
-    if (
-        (stats.bossKills || 0) >= 25
-    ) {
-
-        return 7;
-
-    }
-
-    if (
-        (stats.bossKills || 0) >= 18
-    ) {
-
-        return 6;
-
-    }
-
-    if (
-        (stats.bossKills || 0) >= 12
-    ) {
-
-        return 5;
-
-    }
-
-    if (
-        (stats.bossKills || 0) >= 8
-    ) {
-
-        return 4;
-
-    }
-
-    if (
-        (stats.bossKills || 0) >= 5
-    ) {
-
-        return 3;
-
-    }
-
-    if (
-        (stats.bossKills || 0) >= 3
-    ) {
-
-        return 2;
-
-    }
-
-    return 1;
-
-}
-
-// ============================================================
-// HTTP SERVER
-// ============================================================
-
-const server =
-    http.createServer(
-        (req, res) => {
-
-            // Railway health endpoint.
-
-            if (
-                req.url === "/health"
-            ) {
-
-                res.writeHead(
-                    200,
-                    {
-                        "Content-Type":
-                            "text/plain"
-                    }
-                );
-
-                res.end("OK");
-
-                return;
-
-            }
-
-            // Normal response.
-
-            res.writeHead(
-                200,
-                {
-                    "Content-Type":
-                        "text/plain"
-                }
-            );
-
-            res.end(
-                "Auth server online"
-            );
-
-        }
-    );
-
-// ============================================================
-// WEBSOCKET SERVER
-// ============================================================
-
-const wss =
-    new WebSocketServer({
-        server
-    });
-
-wss.on(
-    "connection",
-    (ws) => {
-
-        console.log(
-            "🔌 WebSocket client connected"
-        );
-
-        // ====================================================
-        // MESSAGE
-        // ====================================================
-
-        ws.on(
-            "message",
-            (msg) => {
-
-                let data;
-
-                try {
-
-                    data =
-                        JSON.parse(
-                            msg.toString()
-                        );
-
-                } catch {
-
-                    console.log(
-                        "⚠️ Invalid JSON received"
-                    );
-
-                    return;
-
-                }
-
-                const {
-                    type,
-                    username,
-                    password_hash,
-                    json,
-                    sig,
-                    secret,
-                    device
-                } = data;
-
-                if (
-                    !type ||
-                    !username
-                ) {
-
-                    return;
-
-                }
-
-                // ====================================================
-                // SECURITY
-                // ====================================================
-
-                // REGISTER and LOGIN are the only
-                // messages that do not require
-                // an existing secret.
-
-                if (
-                    type !== "REGISTER" &&
-                    type !== "LOGIN"
-                ) {
-
-                    if (!secret) {
-
-                        return;
-
-                    }
-
-                    if (
-                        sign(
-                            username,
-                            secret
-                        ) !== sig
-                    ) {
-
-                        flag(
-                            username,
-                            "BAD_SIGNATURE"
-                        );
-
-                        return;
-
-                    }
-
-                }
-
-                // ====================================================
-                // SERVER-AUTHORITATIVE ADMIN STATUS
-                // ====================================================
-
-                getAdmin(
-                    username,
-                    (admin) => {
-
-                        ws.username =
-                            username;
-
-                        ws.isAdmin =
-                            admin;
-
-                        if (
-                            ws.adminStatus !==
-                            admin
-                        ) {
-
-                            ws.adminStatus =
-                                admin;
-
-                            ws.send(
-                                JSON.stringify({
-
-                                    type:
-                                        "ADMIN_STATUS",
-
-                                    admin:
-                                        admin
-
-                                })
-                            );
-
-                        }
-
-                    }
-                );
-
-                // ====================================================
-                // PRESENCE
-                // ====================================================
-
-                if (
-                    type === "PRESENCE_SET"
-                ) {
-
-                    ws.presence =
-                        data.state ||
-                        "online";
-
-                    ws.username =
-                        username;
-
-                    broadcastPresence(
-                        username,
-                        true,
-                        ws.presence
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // CHAT
-                // ====================================================
-
-                if (
-                    type === "CHAT"
-                ) {
-
-                    const {
-                        message,
-                        channel,
-                        target,
-                        msgId
-                    } = data;
-
-                    if (
-                        !message ||
-                        message.length > 200
-                    ) {
-
-                        return;
-
-                    }
-
-                    // Server-side spam throttle.
-
-                    if (
-                        !ws.lastChat
-                    ) {
-
-                        ws.lastChat = 0;
-
-                    }
-
-                    if (
-                        Date.now() -
-                        ws.lastChat <
-                        200
-                    ) {
-
-                        return;
-
-                    }
-
-                    ws.lastChat =
-                        Date.now();
-
-                    const payload =
-                        JSON.stringify({
-
-                            type:
-                                "CHAT_RESP",
-
-                            username,
-
-                            message,
-
-                            channel,
-
-                            target,
-
-                            msgId,
-
-                            serverTime:
-                                Date.now()
-
-                        });
-
-                    // IMPORTANT:
-                    //
-                    // Chat is intentionally broadcast
-                    // to every connected client.
-                    //
-                    // SimpleChatUI performs the final
-                    // whisper visibility filtering.
-                    //
-                    // DO NOT change this to
-                    // target-only routing.
-
-                    wss.clients.forEach(
-                        client => {
-
-                            if (
-                                client.readyState === 1
-                            ) {
-
-                                client.send(
-                                    payload
-                                );
-
-                            }
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // REGISTER
-                // ====================================================
-
-                if (
-                    type === "REGISTER"
-                ) {
-
-                    const s =
-                        makeSecret();
-
-                    db.run(
-                        `
-                        INSERT INTO users(
-                            username,
-                            password_hash,
-                            secret,
-                            device
-                        )
-                        VALUES(?,?,?,?)
-                        `,
-                        [
-                            username,
-                            password_hash,
-                            s,
-                            device
-                        ],
-                        err => {
-
-                            if (err) {
-
-                                console.error(
-                                    "❌ Registration failed:",
-                                    err.message
-                                );
-
-                                ws.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "REGISTER_RESP",
-
-                                        success:
-                                            false
-
-                                    })
-                                );
-
-                            } else {
-
-                                console.log(
-                                    "✅ Registered user:",
-                                    username
-                                );
-
-                                // If the permanent admin
-                                // slots are not full yet,
-                                // randomly fill the remaining
-                                // slots from the player base.
-
-                                ensureRandomAdmins();
-
-                                ws.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "REGISTER_RESP",
-
-                                        success:
-                                            true,
-
-                                        secret:
-                                            s
-
-                                    })
-                                );
-
-                            }
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // LOGIN
-                // ====================================================
-
-                if (
-                    type === "LOGIN"
-                ) {
-
-                    isHWIDBanned(
-                        device,
-                        (reason) => {
-
-                            if (reason) {
-
-                                ws.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "LOGIN_RESP",
-
-                                        success:
-                                            false,
-
-                                        message:
-                                            "HWID BANNED: " +
-                                            reason
-
-                                    })
-                                );
-
-                                return;
-
-                            }
-
-                            db.get(
-                                `
-                                SELECT
-                                    password_hash,
-                                    secret,
-                                    cheat_flags,
-                                    device
-                                FROM users
-                                WHERE username=?
-                                `,
-                                [username],
-                                (e, row) => {
-
-                                    if (
-                                        !row ||
-                                        row.password_hash !==
-                                            password_hash
-                                    ) {
-
-                                        ws.send(
-                                            JSON.stringify({
-
-                                                type:
-                                                    "LOGIN_RESP",
-
-                                                success:
-                                                    false
-
-                                            })
-                                        );
-
-                                        return;
-
-                                    }
-
-                                    db.get(
-                                        `
-                                        SELECT reason
-                                        FROM account_bans
-                                        WHERE username=?
-                                        `,
-                                        [username],
-                                        (banErr, banRow) => {
-
-                                            if (banRow) {
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "LOGIN_RESP",
-
-                                                        success:
-                                                            false,
-
-                                                        message:
-                                                            "Account banned: " +
-                                                            (
-                                                                banRow.reason ||
-                                                                "Moderator ban"
-                                                            )
-
-                                                    })
-                                                );
-
-                                                return;
-
-                                            }
-
-                                            if (
-                                                row.cheat_flags >=
-                                                3
-                                            ) {
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "LOGIN_RESP",
-
-                                                        success:
-                                                            false,
-
-                                                        message:
-                                                            "Account banned"
-
-                                                    })
-                                                );
-
-                                                return;
-
-                                            }
-
-                                            // First login binds device.
-
-                                            if (
-                                                !row.device
-                                            ) {
-
-                                                db.run(
-                                                    `
-                                                    UPDATE users
-                                                    SET device=?
-                                                    WHERE username=?
-                                                    `,
-                                                    [
-                                                        device,
-                                                        username
-                                                    ]
-                                                );
-
-                                            }
-
-                                            // Different device = lock.
-
-                                            else if (
-                                                row.device !==
-                                                device
-                                            ) {
-
-                                                banHWID(
-                                                    device,
-                                                    "Account sharing / evasion"
-                                                );
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "LOGIN_RESP",
-
-                                                        success:
-                                                            false,
-
-                                                        message:
-                                                            "Account locked"
-
-                                                    })
-                                                );
-
-                                                return;
-
-                                            }
-
-                                            // ====================================================
-                                            // ADMIN STATUS
-                                            // ====================================================
-
-                                            getAdmin(
-                                                username,
-                                                (admin) => {
-
-                                                    ws.username =
-                                                        username;
-
-                                                    ws.isAdmin =
-                                                        admin;
-
-                                                    ws.adminStatus =
-                                                        admin;
-
-                                                    ws.send(
-                                                        JSON.stringify({
-
-                                                            type:
-                                                                "LOGIN_RESP",
-
-                                                            success:
-                                                                true,
-
-                                                            secret:
-                                                                row.secret,
-
-                                                            admin:
-                                                                admin
-
-                                                        })
-                                                    );
-
-                                                    ws.send(
-                                                        JSON.stringify({
-
-                                                            type:
-                                                                "ADMIN_STATUS",
-
-                                                            admin:
-                                                                admin
-
-                                                        })
-                                                    );
-
-                                                    // ====================================================
-                                                    // PRESENCE
-                                                    // ====================================================
-
-                                                    broadcastPresence(
-                                                        username,
-                                                        true,
-                                                        "online"
-                                                    );
-
-                                                    broadcastToFriends(
-                                                        username,
-                                                        true
-                                                    );
-
-                                                    sendInitialPresence(
-                                                        username
-                                                    );
-
-                                                }
-                                            );
-
-                                        }
-                                    );
-
-                                }
-                            );
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // FRIEND REQUEST
-                // ====================================================
-
-                if (
-                    type === "FRIEND_REQUEST"
-                ) {
-
-                    const targetUser =
-                        data.target ||
-                        data.to_user;
-
-                    if (
-                        !targetUser ||
-                        targetUser === username
-                    ) {
-
-                        return;
-
-                    }
-
-                    db.get(
-                        `
-                        SELECT username
-                        FROM users
-                        WHERE username=?
-                        `,
-                        [targetUser],
-                        (e, row) => {
-
-                            if (
-                                e ||
-                                !row
-                            ) {
-
-                                ws.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "ERROR",
-
-                                        message:
-                                            "Player not found."
-
-                                    })
-                                );
-
-                                return;
-
-                            }
-
-                            isBlocked(
-                                username,
-                                targetUser,
-                                blocked => {
-
-                                    if (blocked) {
-
-                                        ws.send(
-                                            JSON.stringify({
-
-                                                type:
-                                                    "ERROR",
-
-                                                message:
-                                                    "Player is blocked."
-
-                                            })
-                                        );
-
-                                        return;
-
-                                    }
-
-                                    const [
-                                        a,
-                                        b
-                                    ] =
-                                        normalizePair(
-                                            username,
-                                            targetUser
-                                        );
-
-                                    db.get(
-                                        `
-                                        SELECT 1
-                                        FROM friends
-                                        WHERE
-                                            user1=?
-                                            AND user2=?
-                                        `,
-                                        [
-                                            a,
-                                            b
-                                        ],
-                                        (friendErr, existingFriend) => {
-
-                                            if (
-                                                existingFriend
-                                            ) {
-
-                                                ws.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "ERROR",
-
-                                                        message:
-                                                            "Already friends."
-
-                                                    })
-                                                );
-
-                                                return;
-
-                                            }
-
-                                            db.run(
-                                                `
-                                                INSERT OR IGNORE INTO friend_requests(
-                                                    from_user,
-                                                    to_user,
-                                                    created_at
-                                                )
-                                                VALUES(?,?,?)
-                                                `,
-                                                [
-                                                    username,
-                                                    targetUser,
-                                                    Date.now()
-                                                ],
-                                                requestErr => {
-
-                                                    if (
-                                                        requestErr
-                                                    ) {
-
-                                                        ws.send(
-                                                            JSON.stringify({
-
-                                                                type:
-                                                                    "ERROR",
-
-                                                                message:
-                                                                    "Friend request failed."
-
-                                                            })
-                                                        );
-
-                                                        return;
-
-                                                    }
-
-                                                    ws.send(
-                                                        JSON.stringify({
-
-                                                            type:
-                                                                "FRIEND_UPDATE",
-
-                                                            action:
-                                                                "REQUEST_SENT",
-
-                                                            user:
-                                                                targetUser
-
-                                                        })
-                                                    );
-
-                                                    const targetWs =
-                                                        onlineUsers.get(
-                                                            targetUser
-                                                        );
-
-                                                    if (
-                                                        targetWs &&
-                                                        targetWs.readyState ===
-                                                        1
-                                                    ) {
-
-                                                        targetWs.send(
-                                                            JSON.stringify({
-
-                                                                type:
-                                                                    "FRIEND_UPDATE",
-
-                                                                action:
-                                                                    "REQUEST_RECEIVED",
-
-                                                                user:
-                                                                    username
-
-                                                            })
-                                                        );
-
-                                                    }
-
-                                                }
-                                            );
-
-                                        }
-                                    );
-
-                                }
-                            );
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // FRIEND REQUEST WITHDRAW
-                // ====================================================
-
-                if (
-                    type === "FRIEND_WITHDRAW"
-                ) {
-
-                    const targetUser =
-                        data.target ||
-                        data.to_user;
-
-                    if (!targetUser) {
-                        return;
-                    }
-
-                    db.run(
-                        `
-                        DELETE FROM friend_requests
-                        WHERE
-                            from_user=?
-                            AND to_user=?
-                        `,
-                        [
-                            username,
-                            targetUser
-                        ],
-                        () => {
-
-                            ws.send(
-                                JSON.stringify({
-
-                                    type:
-                                        "FRIEND_UPDATE",
-
-                                    action:
-                                        "REQUEST_WITHDRAWN",
-
-                                    user:
-                                        targetUser
-
-                                })
-                            );
-
-                            const targetWs =
-                                onlineUsers.get(
-                                    targetUser
-                                );
-
-                            if (
-                                targetWs &&
-                                targetWs.readyState === 1
-                            ) {
-
-                                targetWs.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "FRIEND_UPDATE",
-
-                                        action:
-                                            "REQUEST_WITHDRAWN",
-
-                                        user:
-                                            username
-
-                                    })
-                                );
-
-                            }
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // FRIEND ACCEPT
-                // ====================================================
-
-                if (
-                    type === "FRIEND_ACCEPT"
-                ) {
-
-                    const fromUser =
-                        data.from_user ||
-                        data.target;
-
-                    if (!fromUser) {
-                        return;
-                    }
-
-                    db.get(
-                        `
-                        SELECT 1
-                        FROM friend_requests
-                        WHERE
-                            from_user=?
-                            AND to_user=?
-                        `,
-                        [
-                            fromUser,
-                            username
-                        ],
-                        (e, request) => {
-
-                            if (!request) {
-                                return;
-                            }
-
-                            const [
-                                a,
-                                b
-                            ] =
-                                normalizePair(
-                                    username,
-                                    fromUser
-                                );
-
-                            db.run(
-                                `
-                                INSERT OR IGNORE INTO friends(
-                                    user1,
-                                    user2,
-                                    created_at
-                                )
-                                VALUES(?,?,?)
-                                `,
-                                [
-                                    a,
-                                    b,
-                                    Date.now()
-                                ],
-                                () => {
+                                // First login binds device.
+
+                                if (
+                                    !row.device
+                                ) {
 
                                     db.run(
                                         `
-                                        DELETE FROM friend_requests
-                                        WHERE
-                                            from_user=?
-                                            AND to_user=?
+                                        UPDATE users
+                                        SET device=?
+                                        WHERE username=?
                                         `,
                                         [
-                                            fromUser,
+                                            device,
                                             username
-                                        ],
-                                        () => {
-
-                                            ws.send(
-                                                JSON.stringify({
-
-                                                    type:
-                                                        "FRIEND_UPDATE",
-
-                                                    action:
-                                                        "FRIEND_ADDED",
-
-                                                    user:
-                                                        fromUser
-
-                                                })
-                                            );
-
-                                            const targetWs =
-                                                onlineUsers.get(
-                                                    fromUser
-                                                );
-
-                                            if (
-                                                targetWs &&
-                                                targetWs.readyState ===
-                                                1
-                                            ) {
-
-                                                targetWs.send(
-                                                    JSON.stringify({
-
-                                                        type:
-                                                            "FRIEND_UPDATE",
-
-                                                        action:
-                                                            "FRIEND_ADDED",
-
-                                                        user:
-                                                            username
-
-                                                    })
-                                                );
-
-                                            }
-
-                                        }
+                                        ]
                                     );
 
                                 }
-                            );
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // FRIEND REJECT
-                // ====================================================
-
-                if (
-                    type === "FRIEND_REJECT"
-                ) {
-
-                    const fromUser =
-                        data.from_user ||
-                        data.target;
-
-                    if (!fromUser) {
-                        return;
-                    }
-
-                    db.run(
-                        `
-                        DELETE FROM friend_requests
-                        WHERE
-                            from_user=?
-                            AND to_user=?
-                        `,
-                        [
-                            fromUser,
-                            username
-                        ],
-                        () => {
-
-                            ws.send(
-                                JSON.stringify({
 
-                                    type:
-                                        "FRIEND_UPDATE",
+                                // Different device = lock.
 
-                                    action:
-                                        "REQUEST_REJECTED",
+                                else if (
+                                    row.device !==
+                                    device
+                                ) {
 
-                                    user:
-                                        fromUser
+                                    banHWID(
+                                        device,
+                                        "Account sharing / evasion"
+                                    );
 
-                                })
-                            );
 
-                        }
-                    );
+                                    ws.send(
+                                        JSON.stringify({
 
-                    return;
+                                            type:
+                                                "LOGIN_RESP",
 
-                }
+                                            success:
+                                                false,
 
-                // ====================================================
-                // FRIEND DELETE
-                // ====================================================
+                                            message:
+                                                "Account locked"
 
-                if (
-                    type === "FRIEND_DELETE"
-                ) {
+                                        })
+                                    );
 
-                    const friend =
-                        data.target ||
-                        data.user ||
-                        data.friend;
 
-                    if (!friend) {
-                        return;
-                    }
+                                    return;
 
-                    const [
-                        a,
-                        b
-                    ] =
-                        normalizePair(
-                            username,
-                            friend
-                        );
-
-                    db.run(
-                        `
-                        DELETE FROM friends
-                        WHERE
-                            user1=?
-                            AND user2=?
-                        `,
-                        [
-                            a,
-                            b
-                        ],
-                        () => {
+                                }
 
-                            ws.send(
-                                JSON.stringify({
 
-                                    type:
-                                        "FRIEND_UPDATE",
+                                getAdmin(username, (admin) => {
 
-                                    action:
-                                        "FRIEND_DELETED",
+                                    ws.username = username;
+                                    ws.isAdmin = admin;
+                                    ws.adminStatus = admin;
 
-                                    user:
-                                        friend
+                                    ws.send(
+                                        JSON.stringify({
 
-                                })
-                            );
-
-                            const targetWs =
-                                onlineUsers.get(
-                                    friend
-                                );
-
-                            if (
-                                targetWs &&
-                                targetWs.readyState === 1
-                            ) {
-
-                                targetWs.send(
-                                    JSON.stringify({
-
-                                        type:
-                                            "FRIEND_UPDATE",
-
-                                        action:
-                                            "FRIEND_DELETED",
-
-                                        user:
-                                            username
-
-                                    })
-                                );
-
-                            }
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // BLOCK ADD
-                // ====================================================
-
-                if (
-                    type === "BLOCK_ADD"
-                ) {
-
-                    const blocked =
-                        data.target ||
-                        data.blocked ||
-                        data.user;
-
-                    if (
-                        !blocked ||
-                        blocked === username
-                    ) {
-
-                        return;
-
-                    }
-
-                    db.run(
-                        `
-                        INSERT OR IGNORE INTO blocks(
-                            blocker,
-                            blocked,
-                            created_at
-                        )
-                        VALUES(?,?,?)
-                        `,
-                        [
-                            username,
-                            blocked,
-                            Date.now()
-                        ],
-                        () => {
-
-                            ws.send(
-                                JSON.stringify({
-
-                                    type:
-                                        "FRIEND_UPDATE",
-
-                                    action:
-                                        "BLOCK_ADDED",
-
-                                    user:
-                                        blocked
-
-                                })
-                            );
-
-                        }
-                    );
-
-                    return;
-
-                }
-
-                // ====================================================
-                // BLOCK REMOVE
-                // ====================================================
-
-                if (
-                    type === "BLOCK_REMOVE"
-                ) {
-
-                    const blocked =
-                        data.target ||
-                        data.blocked ||
-                        data.user;
-
-                    if (!blocked) {
-                        return;
-                    }
-
-                    db.run(
-                        `
-                        DELETE FROM blocks
-                        WHERE
-                            blocker=?
-                            AND blocked=?
-                        `,
-                        [
-                            username,
-                            blocked
-                        ],
-                        () => {
-
-                            ws.send(
-                                JSON.stringify({
-
-                                    type:
-                                        "FRIEND_UPDATE",
-
-                                    action:
-                                        "BLOCK_REMOVED",
-
-                                    user:
-                                        blocked
-
-                                })
-                            );
-
-                        }
-                    );
-
-                    return;
-
-                }
                                             type:
                                                 "LOGIN_RESP",
 
@@ -2941,7 +1315,7 @@ wss.on(
 
                                         })
                                     );
-                                   
+
                                     ws.send(
                                         JSON.stringify({
                                             type: "ADMIN_STATUS",
@@ -2951,394 +1325,379 @@ wss.on(
                                 });
 
                             }
-
                         );
 
                     }
                 );
 
             }
-
-            return;
-
-        }
+        );
 
 
-        // ====================================================
-        // ====================================================
-        // PLAYER REPORT
-        // ====================================================
+                return;
 
-        if (type === "REPORT_PLAYER") {
+            }
 
-            const target = String(data.target || "").trim();
-            const reason = String(data.reason || "").trim().slice(0, 500);
 
-            if (!target || target === username || !reason) {
-                ws.send(JSON.stringify({
-                    type: "REPORT_PLAYER_RESP",
-                    success: false,
-                    message: "Invalid report."
-                }));
+            // ====================================================
+            // ====================================================
+            // PLAYER REPORT
+            // ====================================================
+
+            if (type === "REPORT_PLAYER") {
+
+                const target = String(data.target || "").trim();
+                const reason = String(data.reason || "").trim().slice(0, 500);
+
+                if (!target || target === username || !reason) {
+                    ws.send(JSON.stringify({
+                        type: "REPORT_PLAYER_RESP",
+                        success: false,
+                        message: "Invalid report."
+                    }));
+                    return;
+                }
+
+                // Small server-side report throttle.
+                const now = Date.now();
+                if (!ws.reportWindow || now - ws.reportWindow >= 60000) {
+                    ws.reportWindow = now;
+                    ws.reportCount = 0;
+                }
+
+                if ((ws.reportCount || 0) >= 5) {
+                    ws.send(JSON.stringify({
+                        type: "REPORT_PLAYER_RESP",
+                        success: false,
+                        message: "Too many reports. Try again later."
+                    }));
+                    return;
+                }
+
+                db.get(
+                    `SELECT username FROM users WHERE username=?`,
+                    [target],
+                    (e, targetRow) => {
+
+                        if (!targetRow) {
+                            ws.send(JSON.stringify({
+                                type: "REPORT_PLAYER_RESP",
+                                success: false,
+                                message: "Player does not exist."
+                            }));
+                            return;
+                        }
+
+                        ws.reportCount = (ws.reportCount || 0) + 1;
+
+                        db.run(
+                            `INSERT INTO reports(reporter,target,reason,created_at,status) VALUES(?,?,?,?,?)`,
+                            [username, target, reason, Date.now(), "open"],
+                            err => {
+                                ws.send(JSON.stringify({
+                                    type: "REPORT_PLAYER_RESP",
+                                    success: !err,
+                                    message: err ? "Report failed." : "Report submitted."
+                                }));
+                            }
+                        );
+                    }
+                );
+
                 return;
             }
 
-            // Small server-side report throttle.
-            const now = Date.now();
-            if (!ws.reportWindow || now - ws.reportWindow >= 60000) {
-                ws.reportWindow = now;
-                ws.reportCount = 0;
-            }
+            // ====================================================
+            // ADMIN REPORTS LOAD
+            // ====================================================
 
-            if ((ws.reportCount || 0) >= 5) {
-                ws.send(JSON.stringify({
-                    type: "REPORT_PLAYER_RESP",
-                    success: false,
-                    message: "Too many reports. Try again later."
-                }));
-                return;
-            }
+            if (type === "REPORTS_LOAD") {
 
-            db.get(
-                `SELECT username FROM users WHERE username=?`,
-                [target],
-                (e, targetRow) => {
-
-                    if (!targetRow) {
+                getAdmin(username, (admin) => {
+                    if (!admin) {
                         ws.send(JSON.stringify({
-                            type: "REPORT_PLAYER_RESP",
+                            type: "REPORTS_LOAD_RESP",
                             success: false,
-                            message: "Player does not exist."
+                            reports: []
                         }));
                         return;
                     }
 
-                    ws.reportCount = (ws.reportCount || 0) + 1;
-
-                    db.run(
-                        `INSERT INTO reports(reporter,target,reason,created_at,status) VALUES(?,?,?,?,?)`,
-                        [username, target, reason, Date.now(), "open"],
-                        err => {
+                    db.all(
+                        `SELECT id, reporter, target, reason, created_at, status
+                         FROM reports
+                         WHERE status='open'
+                         ORDER BY created_at DESC
+                         LIMIT 100`,
+                        [],
+                        (e, reports) => {
                             ws.send(JSON.stringify({
-                                type: "REPORT_PLAYER_RESP",
-                                success: !err,
-                                message: err ? "Report failed." : "Report submitted."
+                                type: "REPORTS_LOAD_RESP",
+                                success: !e,
+                                reports: reports || []
                             }));
                         }
                     );
-                }
-            );
+                });
 
-            return;
-        }
+                return;
+            }
 
-        // ====================================================
-        // ADMIN REPORTS LOAD
-        // ====================================================
+            // ====================================================
+            // ADMIN ACCOUNT BAN
+            // ====================================================
 
-        if (type === "REPORTS_LOAD") {
+            if (type === "ACCOUNT_BAN") {
 
-            getAdmin(username, (admin) => {
-
-                if (!admin) {
-                    ws.send(JSON.stringify({
-                        type: "REPORTS_LOAD_RESP",
-                        success: false,
-                        reports: []
-                    }));
-                    return;
-                }
-
-                db.all(
-                    `SELECT id, reporter, target, reason, created_at, status
-                     FROM reports
-                     WHERE status='open'
-                     ORDER BY created_at DESC
-                     LIMIT 100`,
-                    [],
-                    (e, reports) => {
-
-                        ws.send(JSON.stringify({
-                            type: "REPORTS_LOAD_RESP",
-                            success: !e,
-                            reports: reports || []
-                        }));
-
-                    }
-                );
-
-            });
-
-            return;
-        }
-
-        // ====================================================
-        // ADMIN ACCOUNT BAN
-        // ====================================================
-
-        if (type === "ACCOUNT_BAN") {
-
-            getAdmin(username, (admin) => {
-
-                if (!admin) {
-                    ws.send(JSON.stringify({
-                        type: "ACCOUNT_BAN_RESP",
-                        success: false,
-                        message: "Not authorized."
-                    }));
-                    return;
-                }
-
-                const target = String(data.target || "").trim();
-                const reason = String(data.reason || "Moderator ban").trim().slice(0, 300) || "Moderator ban";
-
-                if (!target || target === username) {
-                    ws.send(JSON.stringify({
-                        type: "ACCOUNT_BAN_RESP",
-                        success: false,
-                        message: "You cannot ban yourself."
-                    }));
-                    return;
-                }
-
-                getAdmin(target, (targetIsAdmin) => {
-
-                    if (targetIsAdmin) {
+                getAdmin(username, (admin) => {
+                    if (!admin) {
                         ws.send(JSON.stringify({
                             type: "ACCOUNT_BAN_RESP",
                             success: false,
-                            message: "Admins cannot ban another admin."
+                            message: "Not authorized."
                         }));
                         return;
                     }
 
-                    db.get(
-                        `SELECT username FROM users WHERE username=?`,
-                        [target],
-                        (e, row) => {
+                    const target = String(data.target || "").trim();
+                    const reason = String(data.reason || "Moderator ban").trim().slice(0, 300) || "Moderator ban";
 
-                            if (!row) {
-                                ws.send(JSON.stringify({
-                                    type: "ACCOUNT_BAN_RESP",
-                                    success: false,
-                                    message: "Player does not exist."
-                                }));
-                                return;
-                            }
+                    if (!target || target === username) {
+                        ws.send(JSON.stringify({
+                            type: "ACCOUNT_BAN_RESP",
+                            success: false,
+                            message: "You cannot ban yourself."
+                        }));
+                        return;
+                    }
 
-                            db.run(
-                                `INSERT INTO account_bans(username,reason,banned_by,created_at)
-                                 VALUES(?,?,?,?)
-                                 ON CONFLICT(username) DO UPDATE SET
-                                     reason=excluded.reason,
-                                     banned_by=excluded.banned_by,
-                                     created_at=excluded.created_at`,
-                                [target, reason, username, Date.now()],
-                                err => {
+                    getAdmin(target, (targetIsAdmin) => {
+                        if (targetIsAdmin) {
+                            ws.send(JSON.stringify({
+                                type: "ACCOUNT_BAN_RESP",
+                                success: false,
+                                message: "Admins cannot ban another admin."
+                            }));
+                            return;
+                        }
 
-                                    if (err) {
-                                        ws.send(JSON.stringify({
-                                            type: "ACCOUNT_BAN_RESP",
-                                            success: false,
-                                            message: "Ban failed."
-                                        }));
-                                        return;
-                                    }
+                        db.get(
+                            `SELECT username FROM users WHERE username=?`,
+                            [target],
+                            (e, row) => {
 
+                                if (!row) {
                                     ws.send(JSON.stringify({
                                         type: "ACCOUNT_BAN_RESP",
-                                        success: true,
-                                        target: target,
-                                        message: "Account banned."
+                                        success: false,
+                                        message: "Player does not exist."
                                     }));
+                                    return;
+                                }
 
-                                    // Immediately remove the banned account if online.
-                                    wss.clients.forEach(client => {
+                                db.run(
+                                    `INSERT INTO account_bans(username,reason,banned_by,created_at)
+                                     VALUES(?,?,?,?)
+                                                                ON CONFLICT(username) DO UPDATE SET
+                                         reason=excluded.reason,
+                                         banned_by=excluded.banned_by,
+                                         created_at=excluded.created_at`,
+                                    [target, reason, username, Date.now()],
+                                    err => {
 
-                                        if (client.username === target) {
-
-                                            try {
-                                                client.send(JSON.stringify({
-                                                    type: "ACCOUNT_BANNED",
-                                                    message: "Your account was banned by a moderator.",
-                                                    reason: reason
-                                                }));
-                                            } catch {}
-
-                                            try {
-                                                client.close(4003, "Account banned");
-                                            } catch {}
-
+                                        if (err) {
+                                            ws.send(JSON.stringify({
+                                                type: "ACCOUNT_BAN_RESP",
+                                                success: false,
+                                                message: "Ban failed."
+                                            }));
+                                            return;
                                         }
 
-                                    });
+                                        ws.send(JSON.stringify({
+                                            type: "ACCOUNT_BAN_RESP",
+                                            success: true,
+                                            target: target,
+                                            message: "Account banned."
+                                        }));
 
-                                }
-                            );
-
-                        }
-                    );
-
+                                        // Immediately remove the banned account if online.
+                                        wss.clients.forEach(client => {
+                                            if (client.username === target) {
+                                                try {
+                                                    client.send(JSON.stringify({
+                                                        type: "ACCOUNT_BANNED",
+                                                        message: "Your account was banned by a moderator.",
+                                                        reason: reason
+                                                    }));
+                                                } catch {}
+                                                try {
+                                                    client.close(4003, "Account banned");
+                                                } catch {}
+                                            }
+                                        });
+                                    }
+                                );
+                            }
+                        );
+                    });
                 });
 
-            });
+                return;
+            }
 
-            return;
-        }
+            // ====================================================
+            // ADMIN ACCOUNT UNBAN
+            // ====================================================
 
-        // ====================================================
-        // ADMIN ACCOUNT UNBAN
-        // ====================================================
+            if (type === "ACCOUNT_UNBAN") {
 
-        if (type === "ACCOUNT_UNBAN") {
-
-            getAdmin(username, (admin) => {
-
-                if (!admin) {
-                    ws.send(JSON.stringify({
-                        type: "ACCOUNT_UNBAN_RESP",
-                        success: false,
-                        message: "Not authorized."
-                    }));
-                    return;
-                }
-
-                const target = String(data.target || "").trim();
-
-                if (!target) {
-                    ws.send(JSON.stringify({
-                        type: "ACCOUNT_UNBAN_RESP",
-                        success: false,
-                        message: "Invalid player."
-                    }));
-                    return;
-                }
-
-                db.run(
-                    `DELETE FROM account_bans WHERE username=?`,
-                    [target],
-                    err => {
-
+                getAdmin(username, (admin) => {
+                    if (!admin) {
                         ws.send(JSON.stringify({
                             type: "ACCOUNT_UNBAN_RESP",
-                            success: !err,
-                            target: target,
-                            message: err ? "Unban failed." : "Account unbanned."
+                            success: false,
+                            message: "Not authorized."
                         }));
+                        return;
+                    }
+
+                    const target = String(data.target || "").trim();
+
+                    if (!target) {
+                        ws.send(JSON.stringify({
+                            type: "ACCOUNT_UNBAN_RESP",
+                            success: false,
+                            message: "Invalid player."
+                        }));
+                        return;
+                    }
+
+                    db.run(
+                        `DELETE FROM account_bans WHERE username=?`,
+                        [target],
+                        err => {
+                            ws.send(JSON.stringify({
+                                type: "ACCOUNT_UNBAN_RESP",
+                                success: !err,
+                                target: target,
+                                message: err ? "Unban failed." : "Account unbanned."
+                            }));
+                        }
+                    );
+                });
+
+                return;
+            }
+
+            // ====================================================
+            // FRIEND REQUEST
+            // ====================================================
+
+ 
+            // ====================================================
+
+            if (
+                type === "FRIEND_REQUEST"
+            ) {
+
+                const target =
+                    data.target;
+
+
+                if (
+                    !target ||
+                    username === target
+                ) {
+
+                    return;
+
+                }
+
+
+                isBlocked(
+                    username,
+                    target,
+                    (blocked) => {
+
+                        if (blocked) {
+
+                            return;
+
+                        }
+
+
+                        const [
+                            u1,
+                            u2
+                        ] =
+                            normalizePair(
+                                username,
+                                target
+                            );
+
+
+                        db.get(
+                            `
+                            SELECT 1
+                            FROM friends
+                            WHERE user1=?
+                            AND user2=?
+                            `,
+                            [
+                                u1,
+                                u2
+                            ],
+                            (e, row) => {
+
+                                if (row) {
+
+                                    return;
+
+                                }
+
+
+                                db.run(
+                                    `
+                                    INSERT OR IGNORE INTO friend_requests
+                                    VALUES(?,?,?)
+                                    `,
+                                    [
+                                        username,
+                                        target,
+                                        Date.now()
+                                    ]
+                                );
+
+                            }
+                        );
 
                     }
                 );
 
-            });
-
-            return;
-        }
-
-        // ====================================================
-        // FRIEND REQUEST
-        // ====================================================
-
-        if (
-            type === "FRIEND_REQUEST"
-        ) {
-
-            const target =
-                data.target;
-
-            if (
-                !target ||
-                username === target
-            ) {
 
                 return;
 
             }
 
-            isBlocked(
-                username,
-                target,
-                (blocked) => {
 
-                    if (blocked) {
+            // ====================================================
+            // FRIEND WITHDRAW
+            // ====================================================
 
-                        return;
+            if (
+                type === "FRIEND_WITHDRAW"
+            ) {
 
-                    }
-
-                    const [
-                        u1,
-                        u2
-                    ] =
-                        normalizePair(
-                            username,
-                            target
-                        );
-
-                    db.get(
-                        `
-                        SELECT 1
-                        FROM friends
-                        WHERE user1=?
-                        AND user2=?
-                        `,
-                        [
-                            u1,
-                            u2
-                        ],
-                        (e, row) => {
-
-                            if (row) {
-
-                                return;
-
-                            }
-
-                            db.run(
-                                `
-                                INSERT OR IGNORE INTO friend_requests
-                                VALUES(?,?,?)
-                                `,
-                                [
-                                    username,
-                                    target,
-                                    Date.now()
-                                ]
-                            );
-
-                        }
-                    );
-
-                }
-            );
-
-            return;
-
-        }
-
-
-        // ====================================================
-        // FRIEND WITHDRAW
-        // ====================================================
-
-        if (
-            type === "FRIEND_WITHDRAW"
-        ) {
-
-            db.run(
-                `
-                DELETE FROM friend_requests
-                WHERE from_user=?
-                AND to_user=?
-                `,
-                [
-                    username,
-                    data.target
-                ]
-            );
-
-            return;
-
-        }
+                db.run(
+                    `
+                    DELETE FROM friend_requests
+                    WHERE from_user=?
+                    AND to_user=?
+                    `,
+                    [
+                        username,
+                        data.target
                     ]
                 );
 
@@ -3568,7 +1927,7 @@ wss.on(
                             DELETE FROM friend_requests
                             WHERE
                                 (from_user=? AND to_user=?)
-                            OR
+                                OR
                                 (from_user=? AND to_user=?)
                             `,
                             [
@@ -3746,45 +2105,6 @@ wss.on(
                         }
 
 
-                        db.run(
-                            `
-                            UPDATE users
-                            SET last_stats_hash=?
-                            WHERE username=?
-                            `,
-                            [
-                                newHash,
-                                username
-                            ]
-                        );
-
-
-                        db.run(
-                            `
-                            INSERT INTO player_stats
-                            (username,json)
-                            VALUES(?,?)
-                            ON CONFLICT(username)
-                            DO UPDATE SET json=excluded.json
-                            `,
-                            [
-                                username,
-                                json
-                            ]
-                        );
-
-                    }
-                );
-
-
-                return;
-
-            }
-                        ) {
-                            return;
-                        }
-
-
                         db.get(
                             `
                             SELECT json
@@ -3795,10 +2115,12 @@ wss.on(
                             (e, row) => {
 
                                 let oldS = {};
+
                                 let newS;
 
 
                                 try {
+
                                     oldS =
                                         row
                                             ? JSON.parse(
@@ -3819,6 +2141,7 @@ wss.on(
                                     );
 
                                     return;
+
                                 }
 
 
@@ -3835,6 +2158,7 @@ wss.on(
                                     );
 
                                     return;
+
                                 }
 
 
@@ -3868,6 +2192,7 @@ wss.on(
                                     ]
                                 );
 
+
                                 // Persistent backup
                                 // on Railway Volume.
 
@@ -3898,6 +2223,7 @@ wss.on(
 
 
                 return;
+
             }
 
 
@@ -3924,6 +2250,7 @@ wss.on(
                         ) {
 
                             return;
+
                         }
 
 
@@ -3941,6 +2268,7 @@ wss.on(
 
                                         type:
                                             "STATS_LOAD_RESP",
+
                                         json:
                                             row
                                                 ? row.json
@@ -3957,6 +2285,7 @@ wss.on(
 
 
                 return;
+
             }
 
 
@@ -4028,6 +2357,7 @@ wss.on(
 
 
                 return;
+
             }
 
         }
@@ -4063,6 +2393,7 @@ wss.on(
     );
 
 }
+
 );
 
 // ============================================================
@@ -4079,6 +2410,7 @@ err => {
     );
 
 }
+
 );
 
 // ============================================================
@@ -4095,6 +2427,7 @@ err => {
     );
 
 }
+
 );
 
 // ============================================================
@@ -4128,7 +2461,7 @@ PORT,
     );
 
     console.log("👑 Permanent random admin slots:", RANDOM_ADMIN_COUNT);
-   
+
     console.log(
         "📁 Backups:",
         BACKUP_DIR
@@ -4144,6 +2477,7 @@ PORT,
     );
 
 }
+
 );
 
 // ============================================================
@@ -4162,6 +2496,7 @@ if (shuttingDown) {
 
 
 shuttingDown = true;
+
 
 console.log(
     "=========================================="
