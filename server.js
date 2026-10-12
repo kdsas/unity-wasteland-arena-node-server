@@ -1566,10 +1566,10 @@ wss.on(
                 return;
             }
 
-                        // ====================================================
+
+            // ====================================================
             // FRIEND ACCEPT
             // ====================================================
-
             if (type === "FRIEND_ACCEPT") {
                 const target = data.target;
 
@@ -1582,11 +1582,9 @@ wss.on(
                 const u2 = pair[1];
 
                 db.get(
-                    `SELECT 1
-                     FROM friend_requests
-                     WHERE from_user = ? AND to_user = ?`,
+                    "SELECT 1 FROM friend_requests WHERE from_user = ? AND to_user = ?",
                     [target, username],
-                    (err, requestRow) => {
+                    (err, row) => {
                         if (err) {
                             console.error(
                                 "[FRIEND_ACCEPT] Request lookup failed:",
@@ -1595,40 +1593,36 @@ wss.on(
                             return;
                         }
 
-                        if (!requestRow) {
+                        if (!row) {
                             return;
                         }
 
-                        db.serialize(() => {
-                            db.run(
-                                `INSERT OR IGNORE INTO friends
-                                 (user1, user2, created_at)
-                                 VALUES (?, ?, ?)`,
-                                [u1, u2, Date.now()],
-                                insertErr => {
-                                    if (insertErr) {
-                                        console.error(
-                                            "[FRIEND_ACCEPT] Friend insert failed:",
-                                            insertErr.message
-                                        );
-                                    }
+                        db.run(
+                            "INSERT OR IGNORE INTO friends (user1, user2, created_at) VALUES (?, ?, ?)",
+                            [u1, u2, Date.now()],
+                            insertErr => {
+                                if (insertErr) {
+                                    console.error(
+                                        "[FRIEND_ACCEPT] Friend insert failed:",
+                                        insertErr.message
+                                    );
+                                    return;
                                 }
-                            );
 
-                            db.run(
-                                `DELETE FROM friend_requests
-                                 WHERE from_user = ? AND to_user = ?`,
-                                [target, username],
-                                deleteErr => {
-                                    if (deleteErr) {
-                                        console.error(
-                                            "[FRIEND_ACCEPT] Request deletion failed:",
-                                            deleteErr.message
-                                        );
+                                db.run(
+                                    "DELETE FROM friend_requests WHERE from_user = ? AND to_user = ?",
+                                    [target, username],
+                                    deleteErr => {
+                                        if (deleteErr) {
+                                            console.error(
+                                                "[FRIEND_ACCEPT] Request deletion failed:",
+                                                deleteErr.message
+                                            );
+                                        }
                                     }
-                                }
-                            );
-                        });
+                                );
+                            }
+                        );
                     }
                 );
 
