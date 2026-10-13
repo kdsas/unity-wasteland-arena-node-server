@@ -1929,10 +1929,10 @@ wss.on(
 
                 return;
             }
-
-        } // End ws.on("message")
+        }); // End ws.on("message")
     } // End wss.on("connection")
 );
+
 
 // ============================================================
 // WEBSOCKET ERROR HANDLING
