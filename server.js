@@ -972,16 +972,20 @@ wss.on(
             // messages that do not require
             // an existing secret.
 
-            if (type !== "REGISTER" && type !== "LOGIN") {
-                if (!secret) {
-                    return;
-                }
+            if (
+    type !== "REGISTER" &&
+    type !== "LOGIN" &&
+    type !== "STATS_SAVE"
+) {
+    if (!secret) {
+        return;
+    }
 
-                if (sign(username, secret) !== sig) {
-                    flag(username, "BAD_SIGNATURE");
-                    return;
-                }
-            }
+    if (sign(username, secret) !== sig) {
+        flag(username, "BAD_SIGNATURE");
+        return;
+    }
+}
 
             // ====================================================
             // SERVER-AUTHORITATIVE ADMIN STATUS
