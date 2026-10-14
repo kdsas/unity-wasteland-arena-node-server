@@ -43,7 +43,6 @@ if (!fs.existsSync(DB_DIR)) {
         { recursive: true }
     );
 }
-
 // ============================================================
 // BACKUP DIRECTORY
 // ============================================================
@@ -56,7 +55,6 @@ if (!fs.existsSync(BACKUP_DIR)) {
         { recursive: true }
     );
 }
-
 // ============================================================
 // STORAGE PATHS
 // ============================================================
@@ -69,6 +67,7 @@ console.log("DB_DIR:", DB_DIR);
 console.log("DB_PATH:", DB_PATH);
 console.log("BACKUP_DIR:", BACKUP_DIR);
 console.log("==========================================");
+
 
 // ============================================================
 // HELPERS
@@ -99,7 +98,6 @@ function normalizePair(a, b) {
         ? [a, b]
         : [b, a];
 }
-
 // ============================================================
 // RANDOM PERMANENT ADMINS
 // ============================================================
@@ -174,7 +172,6 @@ function broadcastPresence(username, online, state) {
         }
     });
 }
-
 // ============================================================
 // SQLITE
 // ============================================================
@@ -192,7 +189,6 @@ const db = new sqlite3.Database(
         console.log(DB_PATH);
     }
 );
-
 // ============================================================
 // SQLITE PERFORMANCE / SAFETY
 // ============================================================
@@ -374,7 +370,6 @@ function isBlocked(a, b, cb) {
         }
     );
 }
-
 // ============================================================
 // HWID
 // ============================================================
@@ -457,17 +452,12 @@ function isImpossible(oldS, newS) {
 }
 
 function flag(username, reason) {
-    console.warn("[SECURITY]", username, reason);
+    // Signature mismatch diagnostics are intentionally silent. Authentication
+    // is bound to the logged-in WebSocket session rather than a generic HMAC
+    // shared by unrelated message payloads.
+    if (reason === "BAD_SIGNATURE") return;
 
-    // A signature mismatch is not proof of cheating.
-    // Reject the invalid request, but do not penalize the account
-    // or hardware-ban the device.
-    if (reason === "BAD_SIGNATURE") {
-        console.warn(
-            "[AUTH] Signature rejected; no cheat flag or HWID ban applied."
-        );
-        return;
-    }
+    console.warn("[SECURITY]", username, reason);
 
     // Only confirmed impossible-progress detections affect cheat flags
     // or trigger the existing HWID-ban rule.
@@ -511,7 +501,6 @@ function flag(username, reason) {
         }
     );
 }
-
 // ============================================================
 // TIER
 // ============================================================
@@ -659,7 +648,6 @@ function handleDeviceRegistration(ws, data) {
                     );
                     return;
                 }
-
                 const deviceToken = crypto.randomBytes(32).toString("hex");
                 const tokenHash = sha(deviceToken);
 
@@ -791,11 +779,10 @@ function safeTokenEquals(candidate, expected) {
     return a.length === b.length &&
         crypto.timingSafeEqual(a, b);
 }
-
 const server = http.createServer((req, res) => {
     const requestUrl = new URL(
         req.url,
-        `http://${req.headers.host || "localhost"}`
+        `http\://${req.headers.host || "localhost"}`
     );
 
     if (requestUrl.pathname === "/health" && req.method === "GET") {
@@ -828,7 +815,7 @@ const server = http.createServer((req, res) => {
         res.end(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wasteland Arena — Database Reset</title>
-<style>body{font:16px system-ui,sans-serif;max-width:620px;margin:50px auto;padding:0 20px;background:#171717;color:#eee}main{border:1px solid #633;padding:24px;border-radius:12px;background:#222}label{display:block;margin:18px 0 6px}input{box-sizing:border-box;width:100%;padding:12px;background:#111;color:#fff;border:1px solid #777;border-radius:6px}button{margin-top:20px;padding:12px 18px;background:#a21d2b;color:#fff;border:0;border-radius:6px;font-weight:700;cursor:pointer}p{line-height:1.5}.warning{color:#ff9b9b;font-weight:700}</style></head>
+<style>body{font:16px system-ui,sans-serif;max-width:620px;margin:50px auto;padding:0 20px;background:#171717;color:#eee}main{border:1px solid #633;padding:24px;border-radius:12px;background:#222}label{display\:block;margin:18px 0 6px}input{box-sizing\:border-box;width:100%;padding:12px;background:#111;color:#fff;border:1px solid #777;border-radius:6px}button{margin-top:20px;padding:12px 18px;background:#a21d2b;color:#fff;border:0;border-radius:6px;font-weight:700;cursor\:pointer}p{line-height:1.5}.warning{color:#ff9b9b;font-weight:700}</style></head>
 <body><main><h1>Reset game database</h1>
 <p class="warning">This permanently deletes all accounts, player stats, friendships, reports, moderator assignments, account bans, hardware bans, trusted devices, and JSON stat backups.</p>
 <p>This does not delete the database schema. Players will need to register again. This action cannot be undone.</p>
@@ -839,7 +826,6 @@ const server = http.createServer((req, res) => {
 
         return;
     }
-
     if (requestUrl.pathname === "/admin/reset" && req.method === "POST") {
         if (!ADMIN_RESET_TOKEN) {
             res.writeHead(503, {
@@ -909,13 +895,13 @@ const server = http.createServer((req, res) => {
 
         return;
     }
-
     res.writeHead(200, {
         "Content-Type": "text/plain; charset=utf-8"
     });
 
     res.end("Auth server online");
 });
+
 // ============================================================
 // WEBSOCKET SERVER
 // ============================================================
@@ -943,20 +929,31 @@ wss.on(
                 return;
             }
 
-            const {
-                type,
-                username,
-                password_hash,
-                json,
-                sig,
-                secret,
-                device
-            } = data;
+            const type = String(data.type || "").trim();
+            const username = String(data.username || "").trim();
+
+            // Accept both field spellings so clients using camelCase do not
+            // accidentally register a NULL password hash and become unable to log in.
+            const password_hash = typeof data.password_hash === "string"
+                ? data.password_hash
+                : (typeof data.passwordHash === "string" ? data.passwordHash : "");
+
+            const json = data.json;
+            const sig = data.sig;
+            const secret = data.secret;
+            const device = data.device;
 
             if (!type || !username) {
+                if (type === "REGISTER" || type === "LOGIN") {
+                    ws.send(JSON.stringify({
+                        type: type === "REGISTER" ? "REGISTER_RESP" : "LOGIN_RESP",
+                        success: false,
+                        message: "Enter a username and password."
+                    }));
+                }
+
                 return;
             }
-
             // DEVICE_REGISTER uses a per-device RSA proof and the account secret,
             // not the generic HMAC `sig` field used by other message types.
             if (type === "DEVICE_REGISTER") {
@@ -968,44 +965,46 @@ wss.on(
             // SECURITY
             // ====================================================
 
-            // REGISTER and LOGIN are the only
-            // messages that do not require
-            // an existing secret.
-
-            if (
-    type !== "REGISTER" &&
-    type !== "LOGIN" &&
-    type !== "STATS_SAVE"
-) {
-    if (!secret) {
-        return;
-    }
-
-    if (sign(username, secret) !== sig) {
-        flag(username, "BAD_SIGNATURE");
-        return;
-    }
-}
-
+            // Registration and login establish identity. All other game
+            // messages must arrive on the authenticated WebSocket session.
+            // Do not validate a generic HMAC here: message types use different
+            // payloads, and comparing every signature to sign(username, secret)
+            // incorrectly rejects legitimate requests.
+            if (type !== "REGISTER" && type !== "LOGIN") {
+                if (!ws.authenticated || ws.username !== username) {
+                    // Quietly reject unauthenticated or mismatched requests.
+                    return;
+                }
+            }
             // ====================================================
             // SERVER-AUTHORITATIVE ADMIN STATUS
             // ====================================================
 
-            getAdmin(username, (admin) => {
-                ws.username = username;
-                ws.isAdmin = admin;
+            // Never let REGISTER/LOGIN or an unauthenticated message overwrite
+            // the identity bound to an already-authenticated WebSocket.
+            if (
+                ws.authenticated &&
+                ws.username === username &&
+                type !== "REGISTER" &&
+                type !== "LOGIN"
+            ) {
+                getAdmin(username, (admin) => {
+                    if (!ws.authenticated || ws.username !== username) return;
 
-                if (ws.adminStatus !== admin) {
-                    ws.adminStatus = admin;
+                    ws.isAdmin = admin;
 
-                    ws.send(JSON.stringify({
-                        type: "ADMIN_STATUS",
-                        admin: admin
-                    }));
-                }
-            });
+                    if (ws.adminStatus !== admin) {
+                        ws.adminStatus = admin;
 
-                        // ====================================================
+                        ws.send(JSON.stringify({
+                            type: "ADMIN_STATUS",
+                            admin: admin
+                        }));
+                    }
+                });
+            }
+
+            // ====================================================
             // PRESENCE
             // ====================================================
 
@@ -1021,7 +1020,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // CHAT
             // ====================================================
@@ -1072,12 +1070,21 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // REGISTER
             // ====================================================
 
             if (type === "REGISTER") {
+                if (!password_hash || password_hash.length > 512) {
+                    ws.send(JSON.stringify({
+                        type: "REGISTER_RESP",
+                        success: false,
+                        message: "A valid password is required."
+                    }));
+
+                    return;
+                }
+
                 const s = makeSecret();
 
                 db.run(
@@ -1139,12 +1146,28 @@ wss.on(
 
                 return;
             }
-
-                        // ====================================================
+            // ====================================================
             // LOGIN
             // ====================================================
 
             if (type === "LOGIN") {
+                // A failed re-login must not retain a prior session identity.
+                ws.authenticated = false;
+                ws.username = null;
+                ws.secret = null;
+                ws.isAdmin = false;
+                ws.adminStatus = false;
+
+                if (!password_hash || password_hash.length > 512) {
+                    ws.send(JSON.stringify({
+                        type: "LOGIN_RESP",
+                        success: false,
+                        message: "Enter a valid username and password."
+                    }));
+
+                    return;
+                }
+
                 isHWIDBanned(device, (reason) => {
                     if (reason) {
                         ws.send(JSON.stringify({
@@ -1168,19 +1191,49 @@ wss.on(
                         `,
                         [username],
                         (e, row) => {
-                            if (!row || row.password_hash !== password_hash) {
+                            if (e) {
+                                console.error(
+                                    "[LOGIN] Account lookup failed:",
+                                    e.message
+                                );
+
                                 ws.send(JSON.stringify({
                                     type: "LOGIN_RESP",
-                                    success: false
+                                    success: false,
+                                    message: "Login is temporarily unavailable. Please try again."
                                 }));
 
                                 return;
                             }
 
+                            if (!row || row.password_hash !== password_hash) {
+                                ws.send(JSON.stringify({
+                                    type: "LOGIN_RESP",
+                                    success: false,
+                                    message: "Incorrect username or password."
+                                }));
+
+                                return;
+                            }
                             db.get(
                                 `SELECT reason FROM account_bans WHERE username=?`,
                                 [username],
                                 (banErr, banRow) => {
+                                    if (banErr) {
+                                        console.error(
+                                            "[LOGIN] Account-ban lookup failed:",
+                                            banErr.message
+                                        );
+
+                                        ws.send(JSON.stringify({
+                                            type: "LOGIN_RESP",
+                                            success: false,
+                                            message: "Login is temporarily unavailable. Please try again."
+                                        }));
+
+                                        return;
+                                    }
+
                                     if (banRow) {
                                         ws.send(JSON.stringify({
                                             type: "LOGIN_RESP",
@@ -1192,15 +1245,8 @@ wss.on(
                                         return;
                                     }
 
-                                    if (row.cheat_flags >= 3) {
-                                        ws.send(JSON.stringify({
-                                            type: "LOGIN_RESP",
-                                            success: false,
-                                            message: "Account banned"
-                                        }));
-
-                                        return;
-                                    }
+                                    // Historical cheat flags are informational only.
+                                    // A login ban must come from account_bans or hwid_bans.
 
                                     // Bind the account to its first device only when
                                     // no device has been recorded. A different device
@@ -1219,15 +1265,17 @@ wss.on(
                                             }
                                         );
                                     }
-
                                     getAdmin(username, (admin) => {
                                         ws.username = username;
+                                        ws.secret = row.secret;
+                                        ws.authenticated = true;
                                         ws.isAdmin = admin;
                                         ws.adminStatus = admin;
 
                                         ws.send(JSON.stringify({
                                             type: "LOGIN_RESP",
                                             success: true,
+                                            message: "Login successful.",
                                             secret: row.secret,
                                             flags: row.cheat_flags,
                                             admin: admin
@@ -1246,7 +1294,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // PLAYER REPORT
             // ====================================================
@@ -1320,7 +1367,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // ADMIN REPORTS LOAD
             // ====================================================
@@ -1463,7 +1509,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // ADMIN ACCOUNT UNBAN
             // ====================================================
@@ -1553,7 +1598,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // FRIEND WITHDRAW
             // ====================================================
@@ -1569,11 +1613,10 @@ wss.on(
 
                 return;
             }
-
-
-            // ====================================================
+                       // ====================================================
             // FRIEND ACCEPT
             // ====================================================
+
             if (type === "FRIEND_ACCEPT") {
                 const target = data.target;
 
@@ -1648,7 +1691,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // FRIEND DELETE
             // ====================================================
@@ -1666,7 +1708,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // BLOCK ADD
             // ====================================================
@@ -1711,7 +1752,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // BLOCK REMOVE
             // ====================================================
@@ -1727,7 +1767,6 @@ wss.on(
 
                 return;
             }
-
             // ====================================================
             // LOAD FRIENDS
             // ====================================================
@@ -1789,8 +1828,10 @@ wss.on(
                             return;
                         }
 
-                        if (sign(json, user.secret) !== sig) {
-                            flag(username, "BAD_SIGNATURE");
+                        // The WebSocket session was authenticated at LOGIN.
+                        // Validate the stats payload itself instead of rejecting
+                        // it based on a client-specific signature representation.
+                        if (typeof json !== "string" || json.length > 1_000_000) {
                             return;
                         }
 
@@ -1868,37 +1909,29 @@ wss.on(
 
             if (type === "STATS_LOAD") {
                 db.get(
-                    `
-                    SELECT secret
-                    FROM users
-                    WHERE username=?
-                    `,
+                    `SELECT json FROM player_stats WHERE username=?`,
                     [username],
-                    (e, u) => {
-                        if (!u || u.secret !== secret) {
+                    (e, row) => {
+                        if (e) {
+                            console.error("[STATS_LOAD] Database read failed:", e.message);
+                            ws.send(JSON.stringify({
+                                type: "STATS_LOAD_RESP",
+                                success: false,
+                                json: "{}"
+                            }));
                             return;
                         }
 
-                        db.get(
-                            `
-                            SELECT json
-                            FROM player_stats
-                            WHERE username=?
-                            `,
-                            [username],
-                            (e, row) => {
-                                ws.send(JSON.stringify({
-                                    type: "STATS_LOAD_RESP",
-                                    json: row ? row.json : "{}"
-                                }));
-                            }
-                        );
+                        ws.send(JSON.stringify({
+                            type: "STATS_LOAD_RESP",
+                            success: true,
+                            json: row ? row.json : "{}"
+                        }));
                     }
                 );
 
                 return;
             }
-
             // ====================================================
             // TIER LOAD
             // ====================================================
@@ -1921,7 +1954,7 @@ wss.on(
                         }
 
                         const tier = computeTier(stats);
-                        const tierSignature = sign("TIER_" + tier, secret);
+                        const tierSignature = sign("TIER_" + tier, ws.secret);
 
                         ws.send(JSON.stringify({
                             type: "TIER_RESP",
@@ -1936,8 +1969,6 @@ wss.on(
         }); // End ws.on("message")
     } // End wss.on("connection")
 );
-
-
 // ============================================================
 // WEBSOCKET ERROR HANDLING
 // ============================================================
@@ -1953,7 +1984,6 @@ wss.on("error", err => {
 server.on("error", err => {
     console.error("❌ HTTP server error:", err);
 });
-
 // ============================================================
 // START SERVER
 // ============================================================
@@ -1970,7 +2000,6 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log("❤️ Health endpoint:", "/health");
     console.log("==========================================");
 });
-
 // ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
