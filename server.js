@@ -1,3 +1,5 @@
+
+
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const sqlite3 = require("sqlite3").verbose();
@@ -111,11 +113,23 @@ const USERNAME_MAX_LENGTH = 20;
 // filter, not a complete hate-speech or impersonation detector.
 const DEFAULT_RESTRICTED_USERNAME_TERMS = [
     "admin", "administrator", "support", "root", "moderator", "mod",
-    "staff", "system", "official"
+    "staff", "system"
 ];
 const DEFAULT_PROTECTED_IDENTITY_TERMS = [
     "staff", "official", "discord", "steam", "playstation", "xbox",
     "roblox", "minecraft", "fortnite", "openai"
+];
+
+// EDIT THIS ARRAY to add terms that must not appear in a username.
+// These are example profanity terms; replace/add entries to match your game's
+// moderation policy. Keep each term in quotes and separate entries with commas.
+const DEFAULT_PROHIBITED_USERNAME_TERMS = [
+ "fuck",
+“cunt”,
+“nigger”,
+“spic”,
+“gook”,
+“kike”
 ];
 
 function readUsernameTermList(envName, defaults = []) {
@@ -134,7 +148,11 @@ const PROTECTED_IDENTITY_TERMS = readUsernameTermList(
     "USERNAME_PROTECTED_TERMS",
     DEFAULT_PROTECTED_IDENTITY_TERMS
 );
-const PROHIBITED_USERNAME_TERMS = readUsernameTermList("USERNAME_PROHIBITED_TERMS");
+
+const PROHIBITED_USERNAME_TERMS = readUsernameTermList(
+    "USERNAME_PROHIBITED_TERMS",
+    DEFAULT_PROHIBITED_USERNAME_TERMS
+);
 
 function compactUsername(value) {
     return String(value || "")
@@ -172,6 +190,15 @@ function validateRegistrationUsername(rawUsername) {
     if (PROHIBITED_USERNAME_TERMS.some(term => usernameContainsTerm(compact, term))) {
         return { ok: false, message: "That username may violate our community guidelines. Please choose another username." };
     }
+
+ if (PROHIBITED_USERNAME_TERMS.some(
+    term => usernameContainsTerm(compact, term)
+)) {
+    return {
+        ok: false,
+        message: "That username may violate our community guidelines. Please choose another username."
+    };
+}
     if (PROTECTED_IDENTITY_TERMS.some(term => usernameContainsTerm(compact, term))) {
         return { ok: false, message: "That username may impersonate a brand, public figure, or official staff member. Please choose another username." };
     }
