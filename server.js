@@ -114,7 +114,7 @@ const DEFAULT_RESTRICTED_USERNAME_TERMS = [
     "staff", "system"
 ];
 const DEFAULT_PROTECTED_IDENTITY_TERMS = [
-    "staff", "official", "discord", "steam", "playstation", "xbox",
+    "staff", "discord", "steam", "playstation", "xbox",
     "roblox", "minecraft", "fortnite", "openai"
 ];
 
