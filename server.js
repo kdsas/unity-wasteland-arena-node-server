@@ -43,6 +43,7 @@ if (!fs.existsSync(DB_DIR)) {
         { recursive: true }
     );
 }
+
 // ============================================================
 // BACKUP DIRECTORY
 // ============================================================
@@ -55,6 +56,7 @@ if (!fs.existsSync(BACKUP_DIR)) {
         { recursive: true }
     );
 }
+
 // ============================================================
 // STORAGE PATHS
 // ============================================================
@@ -67,7 +69,6 @@ console.log("DB_DIR:", DB_DIR);
 console.log("DB_PATH:", DB_PATH);
 console.log("BACKUP_DIR:", BACKUP_DIR);
 console.log("==========================================");
-
 
 // ============================================================
 // HELPERS
@@ -98,6 +99,96 @@ function normalizePair(a, b) {
         ? [a, b]
         : [b, a];
 }
+
+// ============================================================
+// SERVER-AUTHORITATIVE USERNAME VALIDATION
+// ============================================================
+
+const USERNAME_MIN_LENGTH = 3;
+const USERNAME_MAX_LENGTH = 20;
+
+// Extend these lists through the hosting environment. They are a moderation
+// filter, not a complete hate-speech or impersonation detector.
+const DEFAULT_RESTRICTED_USERNAME_TERMS = [
+    "admin", "administrator", "support", "root", "moderator", "mod",
+    "staff", "system", "official"
+];
+const DEFAULT_PROTECTED_IDENTITY_TERMS = [
+    "staff", "official", "discord", "steam", "playstation", "xbox",
+    "roblox", "minecraft", "fortnite", "openai"
+];
+
+function readUsernameTermList(envName, defaults = []) {
+    const configured = String(process.env[envName] || "")
+        .split(",")
+        .map(term => term.trim())
+        .filter(Boolean);
+    return [...new Set([...defaults, ...configured].map(term => term.toLocaleLowerCase()))];
+}
+
+const RESTRICTED_USERNAME_TERMS = readUsernameTermList(
+    "USERNAME_RESTRICTED_TERMS",
+    DEFAULT_RESTRICTED_USERNAME_TERMS
+);
+const PROTECTED_IDENTITY_TERMS = readUsernameTermList(
+    "USERNAME_PROTECTED_TERMS",
+    DEFAULT_PROTECTED_IDENTITY_TERMS
+);
+const PROHIBITED_USERNAME_TERMS = readUsernameTermList("USERNAME_PROHIBITED_TERMS");
+
+function compactUsername(value) {
+    return String(value || "")
+        .normalize("NFKC")
+        .toLocaleLowerCase()
+        .replace(/[\p{P}\p{S}\p{Z}\p{C}_-]+/gu, "");
+}
+
+function usernameContainsTerm(compact, term) {
+    const normalizedTerm = compactUsername(term);
+    return normalizedTerm.length > 0 && compact.includes(normalizedTerm);
+}
+
+function validateRegistrationUsername(rawUsername) {
+    const username = String(rawUsername || "").trim();
+    const length = [...username].length;
+
+    if (!username) {
+        return { ok: false, message: "Please enter a username." };
+    }
+    if (length < USERNAME_MIN_LENGTH) {
+        return { ok: false, message: `Username must be at least ${USERNAME_MIN_LENGTH} characters long.` };
+    }
+    if (length > USERNAME_MAX_LENGTH) {
+        return { ok: false, message: `Username must be no more than ${USERNAME_MAX_LENGTH} characters long.` };
+    }
+    if (/[\p{C}]/u.test(username)) {
+        return { ok: false, message: "Username contains unsupported characters. Please choose another username." };
+    }
+
+    const compact = compactUsername(username);
+    if (RESTRICTED_USERNAME_TERMS.some(term => usernameContainsTerm(compact, term))) {
+        return { ok: false, message: "That username contains a restricted system keyword. Please choose another username." };
+    }
+    if (PROHIBITED_USERNAME_TERMS.some(term => usernameContainsTerm(compact, term))) {
+        return { ok: false, message: "That username may violate our community guidelines. Please choose another username." };
+    }
+    if (PROTECTED_IDENTITY_TERMS.some(term => usernameContainsTerm(compact, term))) {
+        return { ok: false, message: "That username may impersonate a brand, public figure, or official staff member. Please choose another username." };
+    }
+
+    return { ok: true, username };
+}
+
+function sendRegistrationFailure(ws, message) {
+    if (ws.readyState === 1) {
+        ws.send(JSON.stringify({
+            type: "REGISTER_RESP",
+            success: false,
+            message
+        }));
+    }
+}
+
 // ============================================================
 // RANDOM PERMANENT ADMINS
 // ============================================================
@@ -172,6 +263,7 @@ function broadcastPresence(username, online, state) {
         }
     });
 }
+
 // ============================================================
 // SQLITE
 // ============================================================
@@ -189,6 +281,7 @@ const db = new sqlite3.Database(
         console.log(DB_PATH);
     }
 );
+
 // ============================================================
 // SQLITE PERFORMANCE / SAFETY
 // ============================================================
@@ -247,6 +340,22 @@ db.serialize(() => {
             device TEXT
         )
     `);
+
+    // Case-insensitive uniqueness prevents duplicate accounts such as Player
+    // and player, including when two registration requests arrive together.
+    db.run(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase
+         ON users(username COLLATE NOCASE)`,
+        err => {
+            if (err) {
+                console.error(
+                    "[USERNAME SECURITY] Could not create case-insensitive username index. " +
+                    "Check for existing accounts whose usernames differ only by case:",
+                    err.message
+                );
+            }
+        }
+    );
 
     // ================= PLAYER STATS =================
 
@@ -370,6 +479,7 @@ function isBlocked(a, b, cb) {
         }
     );
 }
+
 // ============================================================
 // HWID
 // ============================================================
@@ -501,6 +611,7 @@ function flag(username, reason) {
         }
     );
 }
+
 // ============================================================
 // TIER
 // ============================================================
@@ -648,6 +759,7 @@ function handleDeviceRegistration(ws, data) {
                     );
                     return;
                 }
+
                 const deviceToken = crypto.randomBytes(32).toString("hex");
                 const tokenHash = sha(deviceToken);
 
@@ -779,6 +891,7 @@ function safeTokenEquals(candidate, expected) {
     return a.length === b.length &&
         crypto.timingSafeEqual(a, b);
 }
+
 const server = http.createServer((req, res) => {
     const requestUrl = new URL(
         req.url,
@@ -826,6 +939,7 @@ const server = http.createServer((req, res) => {
 
         return;
     }
+
     if (requestUrl.pathname === "/admin/reset" && req.method === "POST") {
         if (!ADMIN_RESET_TOKEN) {
             res.writeHead(503, {
@@ -895,13 +1009,13 @@ const server = http.createServer((req, res) => {
 
         return;
     }
+
     res.writeHead(200, {
         "Content-Type": "text/plain; charset=utf-8"
     });
 
     res.end("Auth server online");
 });
-
 // ============================================================
 // WEBSOCKET SERVER
 // ============================================================
@@ -931,13 +1045,11 @@ wss.on(
 
             const type = String(data.type || "").trim();
             const username = String(data.username || "").trim();
-
             // Accept both field spellings so clients using camelCase do not
             // accidentally register a NULL password hash and become unable to log in.
             const password_hash = typeof data.password_hash === "string"
                 ? data.password_hash
                 : (typeof data.passwordHash === "string" ? data.passwordHash : "");
-
             const json = data.json;
             const sig = data.sig;
             const secret = data.secret;
@@ -951,9 +1063,9 @@ wss.on(
                         message: "Enter a username and password."
                     }));
                 }
-
                 return;
             }
+
             // DEVICE_REGISTER uses a per-device RSA proof and the account secret,
             // not the generic HMAC `sig` field used by other message types.
             if (type === "DEVICE_REGISTER") {
@@ -976,26 +1088,21 @@ wss.on(
                     return;
                 }
             }
+
             // ====================================================
             // SERVER-AUTHORITATIVE ADMIN STATUS
             // ====================================================
 
             // Never let REGISTER/LOGIN or an unauthenticated message overwrite
             // the identity bound to an already-authenticated WebSocket.
-            if (
-                ws.authenticated &&
-                ws.username === username &&
-                type !== "REGISTER" &&
-                type !== "LOGIN"
-            ) {
+            if (ws.authenticated && ws.username === username &&
+                type !== "REGISTER" && type !== "LOGIN") {
                 getAdmin(username, (admin) => {
                     if (!ws.authenticated || ws.username !== username) return;
-
                     ws.isAdmin = admin;
 
                     if (ws.adminStatus !== admin) {
                         ws.adminStatus = admin;
-
                         ws.send(JSON.stringify({
                             type: "ADMIN_STATUS",
                             admin: admin
@@ -1004,7 +1111,7 @@ wss.on(
                 });
             }
 
-            // ====================================================
+                        // ====================================================
             // PRESENCE
             // ====================================================
 
@@ -1020,6 +1127,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // CHAT
             // ====================================================
@@ -1070,82 +1178,84 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // REGISTER
             // ====================================================
 
             if (type === "REGISTER") {
-                if (!password_hash || password_hash.length > 512) {
-                    ws.send(JSON.stringify({
-                        type: "REGISTER_RESP",
-                        success: false,
-                        message: "A valid password is required."
-                    }));
-
+                const usernameValidation = validateRegistrationUsername(username);
+                if (!usernameValidation.ok) {
+                    sendRegistrationFailure(ws, usernameValidation.message);
                     return;
                 }
 
-                const s = makeSecret();
+                const canonicalUsername = usernameValidation.username;
+                if (!password_hash || password_hash.length > 512) {
+                    sendRegistrationFailure(ws, "A valid password is required.");
+                    return;
+                }
 
-                db.run(
-                    `
-                    INSERT INTO users(
-                        username,
-                        password_hash,
-                        secret,
-                        device
-                    )
-                    VALUES(?,?,?,?)
-                    `,
-                    [
-                        username,
-                        password_hash,
-                        s,
-                        device
-                    ],
-                    err => {
-                        if (err) {
-                            const usernameExists =
-                                err.code === "SQLITE_CONSTRAINT" &&
-                                /users\.username/.test(err.message);
-
-                            const message = usernameExists
-                                ? "Username already exists. Please log in instead."
-                                : "Registration failed. Please try again.";
-
-                            console.error(
-                                "[REGISTER]",
-                                usernameExists
-                                    ? "Username already exists:"
-                                    : "Registration failed:",
-                                username,
-                                err.message
-                            );
-
-                            ws.send(JSON.stringify({
-                                type: "REGISTER_RESP",
-                                success: false,
-                                message
-                            }));
-
+                // Query the authoritative account database so duplicate names
+                // receive a stable response. The unique index is the race guard.
+                db.get(
+                    `SELECT username FROM users WHERE username = ? COLLATE NOCASE LIMIT 1`,
+                    [canonicalUsername],
+                    (lookupErr, existingUser) => {
+                        if (lookupErr) {
+                            console.error("[REGISTER] Username lookup failed:", lookupErr.message);
+                            sendRegistrationFailure(ws, "Registration is temporarily unavailable. Please try again.");
                             return;
                         }
 
-                        console.log("Registered user:", username);
+                        if (existingUser) {
+                            sendRegistrationFailure(ws, "Username already exists. Please choose another username or log in.");
+                            return;
+                        }
 
-                        ensureRandomAdmins();
+                        const s = makeSecret();
+                        db.run(
+                            `INSERT INTO users(username, password_hash, secret, device)
+                             VALUES(?,?,?,?)`,
+                            [canonicalUsername, password_hash, s, device],
+                            err => {
+                                if (err) {
+                                    const usernameExists =
+                                        err.code === "SQLITE_CONSTRAINT" &&
+                                        (/users\.username/i.test(err.message) ||
+                                         /idx_users_username_nocase/i.test(err.message) ||
+                                         /UNIQUE constraint failed: users\.username/i.test(err.message));
+                                    const message = usernameExists
+                                        ? "Username already exists. Please choose another username or log in."
+                                        : "Registration failed. Please try again.";
 
-                        ws.send(JSON.stringify({
-                            type: "REGISTER_RESP",
-                            success: true,
-                            secret: s,
-                            message: "Registration successful."
-                        }));
+                                    console.error(
+                                        "[REGISTER]",
+                                        usernameExists ? "Duplicate username:" : "Registration failed:",
+                                        canonicalUsername,
+                                        err.message
+                                    );
+                                    sendRegistrationFailure(ws, message);
+                                    return;
+                                }
+
+                                console.log("Registered user:", canonicalUsername);
+                                ensureRandomAdmins();
+                                if (ws.readyState === 1) {
+                                    ws.send(JSON.stringify({
+                                        type: "REGISTER_RESP",
+                                        success: true,
+                                        secret: s,
+                                        message: "Registration successful."
+                                    }));
+                                }
+                            }
+                        );
                     }
                 );
-
                 return;
             }
+
             // ====================================================
             // LOGIN
             // ====================================================
@@ -1164,7 +1274,6 @@ wss.on(
                         success: false,
                         message: "Enter a valid username and password."
                     }));
-
                     return;
                 }
 
@@ -1192,17 +1301,12 @@ wss.on(
                         [username],
                         (e, row) => {
                             if (e) {
-                                console.error(
-                                    "[LOGIN] Account lookup failed:",
-                                    e.message
-                                );
-
+                                console.error("[LOGIN] Account lookup failed:", e.message);
                                 ws.send(JSON.stringify({
                                     type: "LOGIN_RESP",
                                     success: false,
                                     message: "Login is temporarily unavailable. Please try again."
                                 }));
-
                                 return;
                             }
 
@@ -1215,22 +1319,18 @@ wss.on(
 
                                 return;
                             }
+
                             db.get(
                                 `SELECT reason FROM account_bans WHERE username=?`,
                                 [username],
                                 (banErr, banRow) => {
                                     if (banErr) {
-                                        console.error(
-                                            "[LOGIN] Account-ban lookup failed:",
-                                            banErr.message
-                                        );
-
+                                        console.error("[LOGIN] Account-ban lookup failed:", banErr.message);
                                         ws.send(JSON.stringify({
                                             type: "LOGIN_RESP",
                                             success: false,
                                             message: "Login is temporarily unavailable. Please try again."
                                         }));
-
                                         return;
                                     }
 
@@ -1265,6 +1365,7 @@ wss.on(
                                             }
                                         );
                                     }
+
                                     getAdmin(username, (admin) => {
                                         ws.username = username;
                                         ws.secret = row.secret;
@@ -1294,6 +1395,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // PLAYER REPORT
             // ====================================================
@@ -1367,6 +1469,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // ADMIN REPORTS LOAD
             // ====================================================
@@ -1509,6 +1612,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // ADMIN ACCOUNT UNBAN
             // ====================================================
@@ -1598,6 +1702,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // FRIEND WITHDRAW
             // ====================================================
@@ -1613,10 +1718,11 @@ wss.on(
 
                 return;
             }
-                       // ====================================================
+
+
+            // ====================================================
             // FRIEND ACCEPT
             // ====================================================
-
             if (type === "FRIEND_ACCEPT") {
                 const target = data.target;
 
@@ -1691,6 +1797,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // FRIEND DELETE
             // ====================================================
@@ -1708,6 +1815,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // BLOCK ADD
             // ====================================================
@@ -1752,6 +1860,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // BLOCK REMOVE
             // ====================================================
@@ -1767,6 +1876,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // LOAD FRIENDS
             // ====================================================
@@ -1932,6 +2042,7 @@ wss.on(
 
                 return;
             }
+
             // ====================================================
             // TIER LOAD
             // ====================================================
@@ -1969,6 +2080,8 @@ wss.on(
         }); // End ws.on("message")
     } // End wss.on("connection")
 );
+
+
 // ============================================================
 // WEBSOCKET ERROR HANDLING
 // ============================================================
@@ -1984,6 +2097,7 @@ wss.on("error", err => {
 server.on("error", err => {
     console.error("❌ HTTP server error:", err);
 });
+
 // ============================================================
 // START SERVER
 // ============================================================
@@ -2000,6 +2114,7 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log("❤️ Health endpoint:", "/health");
     console.log("==========================================");
 });
+
 // ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
@@ -2056,4 +2171,4 @@ function shutdown(signal) {
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGINT", () => shutdown("SIGINT"));  
