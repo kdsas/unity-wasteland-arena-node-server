@@ -125,11 +125,11 @@ const DEFAULT_PROTECTED_IDENTITY_TERMS = [
 // moderation policy. Keep each term in quotes and separate entries with commas.
 const DEFAULT_PROHIBITED_USERNAME_TERMS = [
  "fuck",
-“cunt”,
-“nigger”,
-“spic”,
-“gook”,
-“kike”
+"cunt",
+"nigger",
+"spic",
+"gook",
+"kike"
 ];
 
 function readUsernameTermList(envName, defaults = []) {
