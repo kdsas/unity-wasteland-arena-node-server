@@ -4,6 +4,7 @@ const sqlite3 = require("sqlite3").verbose();
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
+const { domainToASCII } = require("url");
 
 // Random permanent community-admin slots.
 // Change this one number if you want more/fewer admins.
@@ -363,6 +364,66 @@ db.serialize(() => {
             cheat_flags INTEGER DEFAULT 0,
             last_stats_hash TEXT,
             device TEXT
+        )
+    `);
+
+    // Additive migrations for accounts created before email recovery existed.
+    // Duplicate-column errors are expected on later server starts.
+    db.run("ALTER TABLE users ADD COLUMN email TEXT", err => {
+        if (err && !/duplicate column name/i.test(err.message))
+            console.error("[EMAIL DB] Could not add users.email:", err.message);
+    });
+    db.run("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0", err => {
+        if (err && !/duplicate column name/i.test(err.message))
+            console.error("[EMAIL DB] Could not add users.email_verified:", err.message);
+    });
+
+    db.run(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_verified_email_nocase
+         ON users(email COLLATE NOCASE)
+         WHERE email IS NOT NULL AND email_verified = 1`,
+        err => {
+            if (err) console.error("[EMAIL DB] Could not create verified-email uniqueness index:", err.message);
+        }
+    );
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS registration_email_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            device TEXT,
+            code_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            consumed_at INTEGER
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS recovery_email_challenges (
+            recovery_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            used_at INTEGER
+        )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_registration_email_challenges_lookup
+            ON registration_email_challenges(username, email, expires_at)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_recovery_email_challenges_lookup
+            ON recovery_email_challenges(email, created_at, expires_at)`);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS email_api_rate_limits (
+            rate_key TEXT PRIMARY KEY,
+            window_started_at INTEGER NOT NULL,
+            hit_count INTEGER NOT NULL
         )
     `);
 
@@ -865,6 +926,9 @@ async function resetDatabaseAndBackups() {
         "account_bans",
         "hwid_bans",
         "trusted_devices",
+        "registration_email_challenges",
+        "recovery_email_challenges",
+        "email_api_rate_limits",
         "moderators",
         "users"
     ];
@@ -917,11 +981,609 @@ function safeTokenEquals(candidate, expected) {
         crypto.timingSafeEqual(a, b);
 }
 
+// ============================================================
+// EMAIL VERIFICATION / PASSWORD RECOVERY API
+// ============================================================
+// Requires `npm install nodemailer` and server environment variables:
+// SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM,
+// EMAIL_TOKEN_PEPPER (a long random secret, not stored in the client).
+// No recipient-domain allowlist is used; delivery is delegated to the SMTP relay.
+
+let nodemailer = null;
+try {
+    nodemailer = require("nodemailer");
+} catch (err) {
+    console.error("[EMAIL] nodemailer is not installed. Run: npm install nodemailer");
+}
+
+const EMAIL_TOKEN_PEPPER = process.env.EMAIL_TOKEN_PEPPER || "";
+const EMAIL_CODE_TTL_MS = 15 * 60 * 1000;
+const EMAIL_MAX_CODE_ATTEMPTS = 5;
+const GENERIC_RECOVERY_MESSAGE = "If an account exists, instructions have been sent";
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_FROM = process.env.SMTP_FROM || "";
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "").toLowerCase() === "true" || SMTP_PORT === 465;
+let emailTransporter = null;
+let nextEmailRateLimitCleanupAt = 0;
+
+const EMAIL_API_PATHS = new Set([
+    "/auth/registration/email/start",
+    "/auth/registration/email/verify",
+    "/auth/recovery/request",
+    "/auth/recovery/reset"
+]);
+
+function emailApiJson(res, status, payload) {
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff"
+    });
+    res.end(JSON.stringify(payload));
+}
+
+function getEmailTransporter() {
+    if (emailTransporter) return emailTransporter;
+    if (!nodemailer || !SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !SMTP_FROM || !EMAIL_TOKEN_PEPPER) {
+        return null;
+    }
+
+    emailTransporter = nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_SECURE,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+        requireTLS: !SMTP_SECURE,
+        connectionTimeout: 15000,
+        greetingTimeout: 15000,
+        socketTimeout: 20000,
+        tls: { minVersion: "TLSv1.2" }
+    });
+    return emailTransporter;
+}
+
+function emailServiceReady() {
+    return !!getEmailTransporter();
+}
+
+async function sendAccountEmail(to, subject, text) {
+    const transporter = getEmailTransporter();
+    if (!transporter) throw new Error("Email delivery is not configured on the server.");
+    await transporter.sendMail({
+        from: SMTP_FROM,
+        to,
+        subject,
+        text
+    });
+}
+
+function normalizeEmailAddress(value) {
+    const email = String(value || "").trim();
+    if (email.length < 3 || email.length > 254 || /[\s<>]/.test(email)) return null;
+    const at = email.lastIndexOf("@");
+    if (at <= 0 || at === email.length - 1) return null;
+    const local = email.slice(0, at);
+    const rawDomain = email.slice(at + 1);
+    const domain = domainToASCII(rawDomain);
+    if (!domain || local.length > 64 || domain.length > 253 || !domain.includes(".")) return null;
+    if (!/^[^@]+$/.test(local) || !/^[A-Za-z0-9.-]+$/.test(domain)) return null;
+    const labels = domain.split(".");
+    if (labels.some(label => !label || label.length > 63 ||
+        label.startsWith("-") || label.endsWith("-") || !/^[A-Za-z0-9-]+$/.test(label))) return null;
+    return (local + "@" + domain).toLowerCase();
+}
+
+function isValidPasswordHash(value) {
+    if (typeof value !== "string" || value.length > 128) return false;
+    try {
+        const decoded = Buffer.from(value, "base64");
+        return decoded.length === 32 && decoded.toString("base64") === value;
+    } catch {
+        return false;
+    }
+}
+
+function makeEmailCode() {
+    return String(crypto.randomInt(100000, 1000000));
+}
+
+function makeEmailChallengeId() {
+    return crypto.randomBytes(32).toString("hex");
+}
+
+function hashEmailCode(purpose, challengeId, code) {
+    if (!EMAIL_TOKEN_PEPPER) throw new Error("EMAIL_TOKEN_PEPPER is not configured.");
+    return crypto.createHmac("sha256", EMAIL_TOKEN_PEPPER)
+        .update(`${purpose}|${challengeId}|${code}`, "utf8")
+        .digest("hex");
+}
+
+function constantTimeHexEquals(a, b) {
+    if (typeof a !== "string" || typeof b !== "string" || !/^[a-f0-9]{64}$/i.test(a) || !/^[a-f0-9]{64}$/i.test(b)) {
+        return false;
+    }
+    const left = Buffer.from(a, "hex");
+    const right = Buffer.from(b, "hex");
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+async function emailRateLimitAllowed(key, maximum, windowMs) {
+    const now = Date.now();
+    const storedKey = sha(String(key || "unknown"));
+    const result = await dbRunAsync(
+        `INSERT INTO email_api_rate_limits(rate_key, window_started_at, hit_count)
+         VALUES(?, ?, 1)
+         ON CONFLICT(rate_key) DO UPDATE SET
+            window_started_at = CASE
+                WHEN ? - email_api_rate_limits.window_started_at >= ? THEN ?
+                ELSE email_api_rate_limits.window_started_at
+            END,
+            hit_count = CASE
+                WHEN ? - email_api_rate_limits.window_started_at >= ? THEN 1
+                ELSE email_api_rate_limits.hit_count + 1
+            END
+         WHERE ? - email_api_rate_limits.window_started_at >= ?
+            OR email_api_rate_limits.hit_count < ?`,
+        [
+            storedKey, now,
+            now, windowMs, now,
+            now, windowMs,
+            now, windowMs, maximum
+        ]
+    );
+
+    if (now >= nextEmailRateLimitCleanupAt) {
+        nextEmailRateLimitCleanupAt = now + 6 * 60 * 60 * 1000;
+        Promise.all([
+            dbRunAsync("DELETE FROM email_api_rate_limits WHERE window_started_at < ?", [now - 48 * 60 * 60 * 1000]),
+            dbRunAsync("DELETE FROM registration_email_challenges WHERE expires_at <= ? OR consumed_at IS NOT NULL", [now]),
+            dbRunAsync("DELETE FROM recovery_email_challenges WHERE expires_at <= ? OR used_at IS NOT NULL", [now])
+        ]).catch(err => console.error("[EMAIL] Expired challenge/rate-limit cleanup failed:", err.message));
+    }
+
+    return result.changes === 1;
+}
+
+function requestClientIp(req) {
+    // Railway's edge proxy supplies X-Forwarded-For. The first value is the
+    // originating client address when the deployment proxy overwrites it.
+    const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    return forwarded || req.socket.remoteAddress || "unknown";
+}
+
+function isSecureEmailRequest(req) {
+    const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+    const host = String(req.headers.host || "").toLowerCase();
+    const localHost = host.startsWith("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]");
+    return forwardedProto === "https" || (!forwardedProto && localHost);
+}
+
+function readEmailJsonBody(req, maximumBytes = 16384) {
+    return new Promise((resolve, reject) => {
+        let body = "";
+        let total = 0;
+        let tooLarge = false;
+        req.on("data", chunk => {
+            total += chunk.length;
+            if (total > maximumBytes) {
+                tooLarge = true;
+                body = "";
+                return;
+            }
+            if (!tooLarge) body += chunk.toString("utf8");
+        });
+        req.on("end", () => {
+            if (tooLarge) {
+                reject(Object.assign(new Error("Request body too large."), { statusCode: 413 }));
+                return;
+            }
+            try {
+                resolve(JSON.parse(body || "{}"));
+            } catch {
+                reject(Object.assign(new Error("Invalid JSON request body."), { statusCode: 400 }));
+            }
+        });
+        req.on("error", reject);
+    });
+}
+
+function dbGetAsync(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.get(sql, params, (err, row) => err ? reject(err) : resolve(row || null));
+    });
+}
+
+function dbRunAsync(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function (err) {
+            if (err) reject(err);
+            else resolve({ changes: this.changes, lastID: this.lastID });
+        });
+    });
+}
+
+function escapeEmailText(value) {
+    return String(value || "").replace(/[\r\n\t]/g, " ").slice(0, 254);
+}
+
+async function startRegistrationEmail(body, req, res) {
+    const usernameValidation = validateRegistrationUsername(body.username);
+    const email = normalizeEmailAddress(body.email);
+    const passwordHash = body.passwordHash;
+    const device = String(body.device || "").slice(0, 255);
+
+    if (!usernameValidation.ok) {
+        emailApiJson(res, 400, { success: false, message: usernameValidation.message });
+        return;
+    }
+    if (!email || !isValidPasswordHash(passwordHash)) {
+        emailApiJson(res, 400, { success: false, message: "Enter a valid email address and registration details." });
+        return;
+    }
+    if (!emailServiceReady()) {
+        console.error("[EMAIL] Registration verification is disabled: configure nodemailer, SMTP settings, and EMAIL_TOKEN_PEPPER.");
+        emailApiJson(res, 503, { success: false, message: "Email verification is temporarily unavailable. Please try again later." });
+        return;
+    }
+
+    const ip = requestClientIp(req);
+    if (!(await emailRateLimitAllowed(`reg-ip:${ip}`, 8, 60 * 60 * 1000)) ||
+        !(await emailRateLimitAllowed(`reg-email:${sha(email)}`, 4, 60 * 60 * 1000))) {
+        emailApiJson(res, 429, { success: false, message: "Too many verification requests. Please try again later." });
+        return;
+    }
+
+    const username = usernameValidation.username;
+    const existing = await dbGetAsync(
+        `SELECT username FROM users
+         WHERE username = ? COLLATE NOCASE
+            OR (email = ? COLLATE NOCASE AND COALESCE(email_verified, 0) = 1)
+         LIMIT 1`,
+        [username, email]
+    );
+    if (existing) {
+        emailApiJson(res, 409, { success: false, message: "That username or verified email address is already associated with an account." });
+        return;
+    }
+
+    const challengeId = makeEmailChallengeId();
+    const code = makeEmailCode();
+    const now = Date.now();
+    const expiresAt = now + EMAIL_CODE_TTL_MS;
+    const codeHash = hashEmailCode("registration", challengeId, code);
+
+    await dbRunAsync(
+        `DELETE FROM registration_email_challenges
+         WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE OR expires_at <= ?`,
+        [username, email, now]
+    );
+    await dbRunAsync(
+        `INSERT INTO registration_email_challenges
+         (challenge_id, username, email, password_hash, device, code_hash, created_at, expires_at, attempts, consumed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
+        [challengeId, username, email, passwordHash, device, codeHash, now, expiresAt]
+    );
+
+    try {
+        await sendAccountEmail(
+            email,
+            "Wasteland Arena — verify your email",
+            `Hello ${escapeEmailText(username)},\n\nYour Wasteland Arena email verification code is: ${code}\n\nThis code expires in 15 minutes and can only be used once. If you did not try to register, you can ignore this message.`
+        );
+    } catch (err) {
+        console.error("[EMAIL] Registration verification delivery failed:", err.message);
+        await dbRunAsync("DELETE FROM registration_email_challenges WHERE challenge_id = ?", [challengeId]);
+        emailApiJson(res, 503, { success: false, message: "We could not send the verification email. Please try again later." });
+        return;
+    }
+
+    emailApiJson(res, 200, {
+        success: true,
+        challengeId,
+        message: "Verification code sent."
+    });
+}
+
+async function verifyRegistrationEmail(body, req, res) {
+    const ip = requestClientIp(req);
+    if (!(await emailRateLimitAllowed(`reg-verify-ip:${ip}`, 40, 60 * 60 * 1000))) {
+        emailApiJson(res, 429, { success: false, message: "Too many verification attempts. Request a new code later." });
+        return;
+    }
+
+    const challengeId = String(body.challengeId || "").trim();
+    const code = String(body.code || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(challengeId) || !/^\d{6}$/.test(code)) {
+        emailApiJson(res, 400, { success: false, message: "The verification code is invalid or expired. Request a new code." });
+        return;
+    }
+
+    const row = await dbGetAsync(
+        `SELECT * FROM registration_email_challenges WHERE challenge_id = ? AND consumed_at IS NULL`,
+        [challengeId]
+    );
+    const now = Date.now();
+    if (!row || row.expires_at <= now || row.attempts >= EMAIL_MAX_CODE_ATTEMPTS) {
+        emailApiJson(res, 400, { success: false, message: "The verification code is invalid or expired. Request a new code." });
+        return;
+    }
+
+    const expectedHash = hashEmailCode("registration", challengeId, code);
+    if (!constantTimeHexEquals(expectedHash, row.code_hash)) {
+        await dbRunAsync(
+            `UPDATE registration_email_challenges
+             SET attempts = attempts + 1
+             WHERE challenge_id = ? AND consumed_at IS NULL AND attempts < ?`,
+            [challengeId, EMAIL_MAX_CODE_ATTEMPTS]
+        );
+        emailApiJson(res, 400, { success: false, message: "The verification code is incorrect or expired." });
+        return;
+    }
+
+    // Consume before account creation. The username/email unique indexes and
+    // conditional consume make replayed or simultaneous code submissions fail.
+    const consumed = await dbRunAsync(
+        `UPDATE registration_email_challenges
+         SET consumed_at = ?
+         WHERE challenge_id = ? AND consumed_at IS NULL AND expires_at > ? AND attempts < ? AND code_hash = ?`,
+        [now, challengeId, now, EMAIL_MAX_CODE_ATTEMPTS, expectedHash]
+    );
+    if (consumed.changes !== 1) {
+        emailApiJson(res, 400, { success: false, message: "The verification code is invalid, expired, or already used." });
+        return;
+    }
+
+    const secret = makeSecret();
+    try {
+        await dbRunAsync(
+            `INSERT INTO users(username, password_hash, secret, device, email, email_verified)
+             VALUES(?, ?, ?, ?, ?, 1)`,
+            [row.username, row.password_hash, secret, row.device, row.email]
+        );
+    } catch (err) {
+        const duplicate = /UNIQUE constraint failed/i.test(err.message || "");
+        console.error("[EMAIL REGISTER] Account creation failed:", err.message);
+        emailApiJson(res, duplicate ? 409 : 500, {
+            success: false,
+            message: duplicate
+                ? "That username or email address is already associated with an account."
+                : "Registration could not be completed. Please start again."
+        });
+        return;
+    }
+
+    console.log("[EMAIL REGISTER] Verified recovery email and registered account:", row.username);
+    ensureRandomAdmins();
+    emailApiJson(res, 200, {
+        success: true,
+        username: row.username,
+        message: "Registration successful. Recovery email verified."
+    });
+}
+
+async function requestPasswordRecovery(body, req, res) {
+    // Keep the response identical for unknown, unverified, and known addresses.
+    // The email work runs after the generic HTTP response so SMTP delivery time
+    // does not expose whether an account matched the address.
+    const ip = requestClientIp(req);
+    const email = normalizeEmailAddress(body.email);
+    if (!email) {
+        emailApiJson(res, 200, { success: true, message: GENERIC_RECOVERY_MESSAGE });
+        return;
+    }
+
+    const allowed =
+        (await emailRateLimitAllowed(`recovery-ip:${ip}`, 10, 60 * 60 * 1000)) &&
+        (await emailRateLimitAllowed(`recovery-email:${sha(email)}`, 3, 60 * 60 * 1000));
+    if (!allowed) {
+        emailApiJson(res, 200, { success: true, message: GENERIC_RECOVERY_MESSAGE });
+        return;
+    }
+
+    const user = await dbGetAsync(
+        `SELECT username, email FROM users
+         WHERE email = ? COLLATE NOCASE AND COALESCE(email_verified, 0) = 1
+         LIMIT 1`,
+        [email]
+    );
+
+    if (user) {
+        setImmediate(async () => {
+            try {
+                const recoveryId = makeEmailChallengeId();
+                const code = makeEmailCode();
+                const now = Date.now();
+                const codeHash = hashEmailCode("recovery", recoveryId, code);
+
+                await dbRunAsync(
+                    `DELETE FROM recovery_email_challenges
+                     WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE OR expires_at <= ?`,
+                    [user.username, email, now]
+                );
+                await dbRunAsync(
+                    `INSERT INTO recovery_email_challenges
+                     (recovery_id, username, email, code_hash, created_at, expires_at, attempts, used_at)
+                     VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
+                    [recoveryId, user.username, user.email, codeHash, now, now + EMAIL_CODE_TTL_MS]
+                );
+
+                await sendAccountEmail(
+                    user.email,
+                    "Wasteland Arena — account recovery",
+                    `A password-recovery request was made for your Wasteland Arena account.\n\nUsername: ${escapeEmailText(user.username)}\nPassword reset code: ${code}\n\nThe code expires in 15 minutes and can only be used once. If you did not request this, ignore this message and do not share the code with anyone.`
+                );
+            } catch (err) {
+                console.error("[EMAIL RECOVERY] Recovery email processing/delivery failed:", err.message);
+            }
+        });
+    }
+
+    emailApiJson(res, 200, { success: true, message: GENERIC_RECOVERY_MESSAGE });
+}
+
+async function resetPasswordWithRecoveryCode(body, req, res) {
+    const ip = requestClientIp(req);
+    if (!(await emailRateLimitAllowed(`recovery-reset-ip:${ip}`, 40, 60 * 60 * 1000))) {
+        emailApiJson(res, 429, { success: false, message: "Too many reset attempts. Please try again later." });
+        return;
+    }
+
+    const email = normalizeEmailAddress(body.email);
+    const code = String(body.code || "").trim();
+    const newPasswordHash = body.newPasswordHash;
+
+    if (!email || !/^\d{6}$/.test(code) || !isValidPasswordHash(newPasswordHash)) {
+        emailApiJson(res, 400, { success: false, message: "The recovery code or new password is invalid." });
+        return;
+    }
+
+    const row = await dbGetAsync(
+        `SELECT * FROM recovery_email_challenges
+         WHERE email = ? COLLATE NOCASE AND used_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [email]
+    );
+    const now = Date.now();
+
+    if (!row || row.expires_at <= now || row.attempts >= EMAIL_MAX_CODE_ATTEMPTS) {
+        emailApiJson(res, 400, { success: false, message: "The recovery code is invalid or expired. Request a new code." });
+        return;
+    }
+
+    const expectedHash = hashEmailCode("recovery", row.recovery_id, code);
+    if (!constantTimeHexEquals(expectedHash, row.code_hash)) {
+        await dbRunAsync(
+            `UPDATE recovery_email_challenges
+             SET attempts = attempts + 1
+             WHERE recovery_id = ? AND used_at IS NULL AND attempts < ?`,
+            [row.recovery_id, EMAIL_MAX_CODE_ATTEMPTS]
+        );
+        emailApiJson(res, 400, { success: false, message: "The recovery code is incorrect or expired." });
+        return;
+    }
+
+    const consumed = await dbRunAsync(
+        `UPDATE recovery_email_challenges
+         SET used_at = ?
+         WHERE recovery_id = ? AND used_at IS NULL AND expires_at > ? AND attempts < ? AND code_hash = ?`,
+        [now, row.recovery_id, now, EMAIL_MAX_CODE_ATTEMPTS, expectedHash]
+    );
+    if (consumed.changes !== 1) {
+        emailApiJson(res, 400, { success: false, message: "The recovery code is invalid, expired, or already used." });
+        return;
+    }
+
+    const newSecret = makeSecret();
+    const changed = await dbRunAsync(
+        `UPDATE users
+         SET password_hash = ?, secret = ?
+         WHERE username = ? AND email = ? COLLATE NOCASE AND COALESCE(email_verified, 0) = 1`,
+        [newPasswordHash, newSecret, row.username, row.email]
+    );
+    if (changed.changes !== 1) {
+        console.error("[EMAIL RECOVERY] Account credential update failed after code validation for:", row.username);
+        emailApiJson(res, 500, { success: false, message: "Password reset could not be completed. Please request a new recovery code." });
+        return;
+    }
+
+    // Revoke remembered-device registrations and active WebSocket sessions.
+    await dbRunAsync("DELETE FROM trusted_devices WHERE username = ?", [row.username]);
+    await dbRunAsync("DELETE FROM recovery_email_challenges WHERE username = ?", [row.username]);
+
+    if (typeof wss !== "undefined") {
+        wss.clients.forEach(client => {
+            if (client.username === row.username) {
+                try { client.close(4001, "Account password changed; please sign in again."); } catch {}
+            }
+        });
+    }
+
+    let notificationSent = false;
+    try {
+        await sendAccountEmail(
+            row.email,
+            "Wasteland Arena — your password was changed",
+            `The password for your Wasteland Arena account (${escapeEmailText(row.username)}) was successfully changed.\n\nIf you did not make this change, contact game support immediately and secure the email account associated with your profile.`
+        );
+        notificationSent = true;
+    } catch (err) {
+        console.error("[EMAIL RECOVERY] Password-changed notification delivery failed:", err.message);
+    }
+
+    emailApiJson(res, 200, {
+        success: true,
+        username: row.username,
+        message: notificationSent
+            ? "Password reset successful. A password-change notification was sent to your verified email address."
+            : "Password reset successful, but the password-change notification could not be delivered. Please contact support if you did not make this change."
+    });
+}
+
+async function handleEmailApiRequest(req, res, pathname) {
+    if (req.method !== "POST") {
+        emailApiJson(res, 405, { success: false, message: "Method not allowed." });
+        return;
+    }
+
+    if (!isSecureEmailRequest(req)) {
+        emailApiJson(res, 426, { success: false, message: "Email account operations require HTTPS." });
+        return;
+    }
+
+    if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+        emailApiJson(res, 415, { success: false, message: "Content-Type must be application/json." });
+        return;
+    }
+
+    try {
+        const body = await readEmailJsonBody(req);
+        switch (pathname) {
+            case "/auth/registration/email/start":
+                await startRegistrationEmail(body, req, res);
+                return;
+            case "/auth/registration/email/verify":
+                await verifyRegistrationEmail(body, req, res);
+                return;
+            case "/auth/recovery/request":
+                if (!emailServiceReady()) {
+                    emailApiJson(res, 503, { success: false, message: "The email service is temporarily unavailable." });
+                    return;
+                }
+                await requestPasswordRecovery(body, req, res);
+                return;
+            case "/auth/recovery/reset":
+                await resetPasswordWithRecoveryCode(body, req, res);
+                return;
+            default:
+                emailApiJson(res, 404, { success: false, message: "Not found." });
+                return;
+        }
+    } catch (err) {
+        console.error("[EMAIL API] Request failed:", err.message);
+        emailApiJson(res, err.statusCode || 500, {
+            success: false,
+            message: err.statusCode === 400
+                ? "Invalid request."
+                : "The email service is temporarily unavailable. Please try again later."
+        });
+    }
+}
+
 const server = http.createServer((req, res) => {
     const requestUrl = new URL(
         req.url,
         `http\://${req.headers.host || "localhost"}`
     );
+
+    if (EMAIL_API_PATHS.has(requestUrl.pathname)) {
+        handleEmailApiRequest(req, res, requestUrl.pathname);
+        return;
+    }
 
     if (requestUrl.pathname === "/health" && req.method === "GET") {
         res.writeHead(200, {
@@ -1051,14 +1713,15 @@ const wss = new WebSocketServer({
 
 wss.on(
     "connection",
-    (ws) => {
+    (ws, request) => {
+        ws.clientIp = request ? requestClientIp(request) : "unknown";
         console.log("🔌 WebSocket client connected");
 
         // ====================================================
         // MESSAGE
         // ====================================================
 
-        ws.on("message", (msg) => {
+        ws.on("message", async (msg) => {
             let data;
 
             try {
@@ -1298,6 +1961,38 @@ wss.on(
                         type: "LOGIN_RESP",
                         success: false,
                         message: "Enter a valid username and password."
+                    }));
+                    return;
+                }
+
+                // Server-side login throttling is independent of the Unity UI's
+                // three-failure recovery prompt. Counters persist in SQLite.
+                try {
+                    const ipAllowed = await emailRateLimitAllowed(
+                        `login-ip:${ws.clientIp || "unknown"}`,
+                        30,
+                        60 * 1000
+                    );
+                    const accountAllowed = await emailRateLimitAllowed(
+                        `login-account:${username.toLocaleLowerCase()}`,
+                        20,
+                        15 * 60 * 1000
+                    );
+
+                    if (!ipAllowed || !accountAllowed) {
+                        ws.send(JSON.stringify({
+                            type: "LOGIN_RESP",
+                            success: false,
+                            message: "Too many login attempts. Please wait before trying again."
+                        }));
+                        return;
+                    }
+                } catch (rateLimitErr) {
+                    console.error("[LOGIN] Rate-limit check failed:", rateLimitErr.message);
+                    ws.send(JSON.stringify({
+                        type: "LOGIN_RESP",
+                        success: false,
+                        message: "Login is temporarily unavailable. Please try again."
                     }));
                     return;
                 }
