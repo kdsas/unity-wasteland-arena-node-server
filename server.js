@@ -916,6 +916,90 @@ function runDatabaseStatement(sql) {
     });
 }
 
+async function deletePlayerAccountAndData(usernameInput) {
+    const requestedUsername = String(usernameInput || "").trim();
+    if (!requestedUsername || requestedUsername.length > 20) {
+        throw new Error("A valid username is required.");
+    }
+
+    // Resolve the exact stored username, but allow the admin to enter any case.
+    const account = await dbGetAsync(
+        "SELECT username FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+        [requestedUsername]
+    );
+
+    if (!account) {
+        return { deleted: false, username: requestedUsername };
+    }
+
+    const username = account.username;
+    const usernameLower = username.toLocaleLowerCase();
+
+    // Capture the account's stored device before deleting its user row.
+    const accountRow = await dbGetAsync(
+        "SELECT device FROM users WHERE username = ?",
+        [username]
+    );
+
+    // Delete every row that refers to this account. Reports are removed both
+    // when this player filed the report and when this player was reported.
+    const statements = [
+        ["DELETE FROM player_stats WHERE username = ?", [username]],
+        ["DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]],
+        ["DELETE FROM friend_requests WHERE from_user = ? OR to_user = ?", [username, username]],
+        ["DELETE FROM blocks WHERE blocker = ? OR blocked = ?", [username, username]],
+        ["DELETE FROM reports WHERE reporter = ? OR target = ?", [username, username]],
+        ["DELETE FROM account_bans WHERE username = ?", [username]],
+        ["DELETE FROM moderators WHERE username = ?", [username]],
+        ["DELETE FROM trusted_devices WHERE username = ?", [username]],
+        ["DELETE FROM registration_email_challenges WHERE username = ? COLLATE NOCASE", [username]],
+        ["DELETE FROM recovery_email_challenges WHERE username = ? COLLATE NOCASE", [username]],
+        ["DELETE FROM email_api_rate_limits WHERE rate_key = ?", [`login-account:${usernameLower}`]],
+        ["DELETE FROM users WHERE username = ?", [username]]
+    ];
+
+    await runDatabaseStatement("BEGIN IMMEDIATE TRANSACTION");
+    try {
+        for (const [sql, params] of statements) {
+            await dbRunAsync(sql, params);
+        }
+        await runDatabaseStatement("COMMIT");
+    } catch (err) {
+        try { await runDatabaseStatement("ROLLBACK"); } catch {}
+        throw err;
+    }
+
+    // Remove the player's individual JSON stat backup, if one exists.
+    // Usernames are validated at registration; basename check adds a second
+    // safeguard so a crafted input can never address a file outside BACKUP_DIR.
+    const backupName = `${username}.json`;
+    if (path.basename(backupName) === backupName) {
+        const backupPath = path.join(BACKUP_DIR, backupName);
+        try {
+            if (fs.existsSync(backupPath) && fs.statSync(backupPath).isFile()) {
+                fs.unlinkSync(backupPath);
+            }
+        } catch (err) {
+            console.error(`[ADMIN DELETE] Could not remove stat backup for ${username}:`, err.message);
+            throw new Error("The database account was deleted, but its stat backup could not be removed. Check the server logs.");
+        }
+    }
+
+    // Close every live session for the deleted account so it cannot continue
+    // playing or recreate account data using an already-authenticated socket.
+    if (typeof wss !== "undefined") {
+        wss.clients.forEach(client => {
+            if (String(client.username || "").toLocaleLowerCase() === usernameLower) {
+                try { client.close(4001, "Your account was deleted by the server administrator."); } catch {}
+            }
+        });
+    }
+
+    // Do not remove a matching HWID ban: those are device-wide moderation
+    // records and may intentionally apply to other accounts on the same device.
+    return { deleted: true, username, device: accountRow ? accountRow.device : null };
+}
+
 async function resetDatabaseAndBackups() {
     const tablesToClear = [
         "player_stats",
@@ -1594,6 +1678,99 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ============================================================
+    // ADMIN: DELETE ONE PLAYER ACCOUNT
+    // Uses the same private ADMIN_RESET_TOKEN as the full database reset.
+    // This page is administrator-only; players have no self-service route.
+    // ============================================================
+
+    if (requestUrl.pathname === "/admin/delete-account" && req.method === "GET") {
+        if (!ADMIN_RESET_TOKEN) {
+            res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Account deletion is disabled. Set ADMIN_RESET_TOKEN in the server environment to enable administrator tools.");
+            return;
+        }
+
+        res.writeHead(200, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff"
+        });
+        res.end(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wasteland Arena — Delete Player Account</title>
+<style>body{font:16px system-ui,sans-serif;max-width:620px;margin:50px auto;padding:0 20px;background:#171717;color:#eee}main{border:1px solid #633;padding:24px;border-radius:12px;background:#222}label{display:block;margin:18px 0 6px}input{box-sizing:border-box;width:100%;padding:12px;background:#111;color:#fff;border:1px solid #777;border-radius:6px}button{margin-top:20px;padding:12px 18px;background:#a21d2b;color:#fff;border:0;border-radius:6px;font-weight:700;cursor:pointer}p{line-height:1.5}.warning{color:#ff9b9b;font-weight:700}a{color:#9cf}</style></head>
+<body><main><h1>Delete one player account</h1>
+<p class="warning">This permanently deletes the selected player's account and associated player data. This cannot be undone.</p>
+<p>It removes their account, saved stats and JSON backup, friendships, friend requests, blocks, reports filed by or against them, account ban, moderator assignment, trusted devices, email verification/recovery challenges, and active sessions. It does not delete other players' data or the database schema.</p>
+<form method="post" action="/admin/delete-account" onsubmit="return confirm('FINAL WARNING: permanently delete this player account and all associated data?');">
+<label for="token">Admin reset token</label><input id="token" name="token" type="password" autocomplete="current-password" required>
+<label for="username">Exact player username</label><input id="username" name="username" maxlength="20" autocomplete="off" required>
+<label for="confirmation">Type DELETE followed by the exact username</label><input id="confirmation" name="confirmation" autocomplete="off" required>
+<button type="submit">DELETE THIS PLAYER ACCOUNT</button></form>
+<p><a href="/admin/reset">Back to database reset page</a></p></main></body></html>`);
+        return;
+    }
+
+    if (requestUrl.pathname === "/admin/delete-account" && req.method === "POST") {
+        if (!ADMIN_RESET_TOKEN) {
+            res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Account deletion is disabled.");
+            return;
+        }
+
+        let body = "";
+        let tooLarge = false;
+        req.on("data", chunk => {
+            body += chunk.toString("utf8");
+            if (body.length > 8192) {
+                tooLarge = true;
+                res.writeHead(413, { "Content-Type": "text/plain; charset=utf-8" });
+                res.end("Request too large.");
+                req.destroy();
+            }
+        });
+
+        req.on("end", async () => {
+            if (tooLarge) return;
+            const form = new URLSearchParams(body);
+            const token = form.get("token") || "";
+            const username = String(form.get("username") || "").trim();
+            const confirmation = form.get("confirmation") || "";
+
+            if (!safeTokenEquals(token, ADMIN_RESET_TOKEN)) {
+                res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+                res.end("Forbidden: invalid admin reset token.");
+                return;
+            }
+            if (!username || username.length > 20 || confirmation !== `DELETE ${username}`) {
+                res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+                res.end("Deletion cancelled: enter the exact username and type DELETE followed by that exact username.");
+                return;
+            }
+
+            try {
+                const result = await deletePlayerAccountAndData(username);
+                res.writeHead(result.deleted ? 200 : 404, {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff"
+                });
+                if (result.deleted) {
+                    console.warn(`[ADMIN DELETE] Account and associated data deleted: ${result.username}`);
+                    res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Account deleted</title></head><body style="font:16px system-ui;max-width:620px;margin:50px auto;padding:0 20px;background:#171717;color:#eee"><h1>Player account deleted</h1><p>Account <strong>${escapeEmailText(result.username).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}</strong> and its associated database records and stat backup were deleted.</p><p><a style="color:#9cf" href="/admin/delete-account">Delete another account</a></p></body></html>`);
+                } else {
+                    res.end("<!doctype html><html><head><meta charset='utf-8'><title>Account not found</title></head><body style='font:16px system-ui;max-width:620px;margin:50px auto;padding:0 20px;background:#171717;color:#eee'><h1>Account not found</h1><p>No account matched that username. No data was deleted.</p><p><a style='color:#9cf' href='/admin/delete-account'>Return</a></p></body></html>");
+                }
+            } catch (err) {
+                console.error("[ADMIN DELETE] Failed:", err);
+                res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+                res.end("Account deletion failed. Check the server logs. Database changes are rolled back if the deletion transaction fails.");
+            }
+        });
+        return;
+    }
+
     if (requestUrl.pathname === "/admin/reset" && req.method === "GET") {
         if (!ADMIN_RESET_TOKEN) {
             res.writeHead(503, {
@@ -1619,6 +1796,7 @@ const server = http.createServer((req, res) => {
 <body><main><h1>Reset game database</h1>
 <p class="warning">This permanently deletes all accounts, player stats, friendships, reports, moderator assignments, account bans, hardware bans, trusted devices, and JSON stat backups.</p>
 <p>This does not delete the database schema. Players will need to register again. This action cannot be undone.</p>
+<p><a href="/admin/delete-account" style="color:#9cf">Delete one player's account instead</a></p>
 <form method="post" action="/admin/reset" onsubmit="return confirm('FINAL WARNING: permanently erase all game data?');">
 <label for="token">Admin reset token</label><input id="token" name="token" type="password" autocomplete="current-password" required>
 <label for="confirmation">Type RESET ALL DATA to confirm</label><input id="confirmation" name="confirmation" required autocomplete="off">
