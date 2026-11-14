@@ -1096,6 +1096,7 @@ let nextEmailRateLimitCleanupAt = 0;
 const EMAIL_API_PATHS = new Set([
     "/auth/registration/email/start",
     "/auth/registration/email/verify",
+    "/auth/recovery/status",
     "/auth/recovery/request",
     "/auth/recovery/reset"
 ]);
@@ -1450,6 +1451,73 @@ async function verifyRegistrationEmail(body, req, res) {
     });
 }
 
+// Check whether an account has a verified recovery email.
+// The actual email address is never returned to the client.
+async function checkRecoveryEmailStatus(body, req, res) {
+    const username = String(body.username || "").trim();
+
+    // Invalid or missing usernames fail closed without revealing account details.
+    if (!username || username.length < USERNAME_MIN_LENGTH ||
+        username.length > USERNAME_MAX_LENGTH) {
+        emailApiJson(res, 200, {
+            success: true,
+            hasVerifiedRecoveryEmail: false
+        });
+        return;
+    }
+
+    const ip = requestClientIp(req);
+
+    // This endpoint necessarily returns a yes/no eligibility result to the
+    // game client. Rate-limit by both IP and normalized username to reduce
+    // account-enumeration abuse.
+    const ipAllowed = await emailRateLimitAllowed(
+        `recovery-status-ip:${ip}`,
+        30,
+        60 * 60 * 1000
+    );
+
+    if (!ipAllowed) {
+        emailApiJson(res, 429, {
+            success: false,
+            hasVerifiedRecoveryEmail: false,
+            message: "Too many recovery checks. Please try again later."
+        });
+        return;
+    }
+
+    const usernameAllowed = await emailRateLimitAllowed(
+        `recovery-status-user:${username.toLocaleLowerCase()}`,
+        10,
+        60 * 60 * 1000
+    );
+
+    if (!usernameAllowed) {
+        emailApiJson(res, 429, {
+            success: false,
+            hasVerifiedRecoveryEmail: false,
+            message: "Too many recovery checks. Please try again later."
+        });
+        return;
+    }
+
+    const account = await dbGetAsync(
+        `SELECT 1
+         FROM users
+         WHERE username = ? COLLATE NOCASE
+           AND COALESCE(email_verified, 0) = 1
+           AND email IS NOT NULL
+           AND LENGTH(TRIM(email)) > 0
+         LIMIT 1`,
+        [username]
+    );
+
+    emailApiJson(res, 200, {
+        success: true,
+        hasVerifiedRecoveryEmail: !!account
+    });
+}
+
 async function requestPasswordRecovery(body, req, res) {
     // Keep the response identical for unknown, unverified, and known addresses.
     // The email work runs after the generic HTTP response so SMTP delivery time
@@ -1632,6 +1700,9 @@ async function handleEmailApiRequest(req, res, pathname) {
                 return;
             case "/auth/registration/email/verify":
                 await verifyRegistrationEmail(body, req, res);
+                return;
+            case "/auth/recovery/status":
+                await checkRecoveryEmailStatus(body, req, res);
                 return;
             case "/auth/recovery/request":
                 if (!emailServiceReady()) {
